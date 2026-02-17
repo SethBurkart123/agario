@@ -1,0 +1,27 @@
+[project]
+name = "agario-ai-bot"
+version = "0.1.0"
+description = "Tiny AlphaZero-style Agar bot with search, value function, and self-play training"
+readme = "README.md"
+authors = [
+    { name = "sethburkart123", email = "seth.burkart@hills.adventist.edu.au" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "agario",
+    "numpy>=2.1.0",
+    "torch>=2.5.0",
+    "tqdm>=4.67.0",
+]
+
+[project.scripts]
+agario-ai-bot = "agario_ai_bot:main"
+agario-ai-train = "agario_ai_bot.train:main"
+agario-ai-demo = "agario_ai_bot.demo:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+agario = { workspace = true }

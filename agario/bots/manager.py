@@ -173,6 +173,8 @@ class BotManager:
             if not is_alive and was_alive:
                 self._spawn_extra_on_elimination(agent, now)
             agent.memory["_was_alive"] = is_alive
+            # AI search plugins can run rollout planning against a cloned authoritative world.
+            agent.memory["_world"] = self.world
 
             team_key = self._team_key(agent.plugin_name, agent.team_id)
             team_state = self._team_state.setdefault(team_key, {})

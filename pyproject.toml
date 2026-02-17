@@ -11,3 +11,8 @@ dependencies = [
 
 [project.scripts]
 agario = "main:main"
+
+[tool.uv.workspace]
+members = [
+    "ai_bot",
+]

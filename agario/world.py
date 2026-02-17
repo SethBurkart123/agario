@@ -52,6 +52,20 @@ class GameWorld:
         self._spawn_initial_viruses()
         self._rebuild_spatial_indexes()
 
+    def __getstate__(self) -> dict:
+        # Spatial hashes are derived data and expensive to deepcopy.
+        state = dict(self.__dict__)
+        state["food_hash"] = None
+        state["blob_hash"] = None
+        state["ejected_hash"] = None
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self.food_hash = SpatialHash(150.0)
+        self.blob_hash = SpatialHash(250.0)
+        self.ejected_hash = SpatialHash(180.0)
+
     def _next_player_id(self) -> str:
         return f"p{next(self._player_ids)}"
 
@@ -590,24 +604,8 @@ class GameWorld:
         ]
         return (blobs, foods, ejected, viruses)
 
-    def snapshot_for(self, player_id: str) -> dict | None:
-        player = self.players.get(player_id)
-        if player is None:
-            return None
-
-        cx, cy = player.center()
-        total_mass = max(player.total_mass, config.PLAYER_START_MASS)
-        split_count = max(0, len(player.blobs) - 1)
-        base_zoom = 1.52 - (total_mass ** 0.4) / 22.0
-        split_penalty = split_count * 0.055
-        zoom = _clamp(base_zoom - split_penalty, 0.24, 1.35)
-        view_w = config.VIEW_WIDTH / zoom + config.VIEW_PADDING
-        view_h = config.VIEW_HEIGHT / zoom + config.VIEW_PADDING
-
-        blobs, foods, ejected, viruses = self._visible_entities(cx, cy, view_w, view_h)
-        player_lookup = {p.id: p for p in self.players.values()}
-
-        leaderboard = sorted(
+    def _leaderboard(self) -> list[dict]:
+        return sorted(
             (
                 {"name": p.name, "score": round(p.total_mass)}
                 for p in self.players.values()
@@ -617,13 +615,28 @@ class GameWorld:
             reverse=True,
         )[:10]
 
+    def _snapshot_payload(
+        self,
+        *,
+        you: str | None,
+        player_name: str,
+        player_score: float,
+        camera_x: float,
+        camera_y: float,
+        camera_zoom: float,
+        blobs: list[Blob],
+        foods: list[Food],
+        ejected: list[EjectedMass],
+        viruses: list[Virus],
+    ) -> dict:
+        player_lookup = {p.id: p for p in self.players.values()}
         return {
             "type": "state",
-            "you": player.id,
+            "you": you,
             "world": {"w": config.WORLD_WIDTH, "h": config.WORLD_HEIGHT},
-            "camera": {"x": round(cx, 2), "y": round(cy, 2), "zoom": round(zoom, 3)},
-            "player": {"name": player.name, "score": round(player.total_mass)},
-            "leaderboard": leaderboard,
+            "camera": {"x": round(camera_x, 2), "y": round(camera_y, 2), "zoom": round(camera_zoom, 3)},
+            "player": {"name": player_name, "score": round(player_score)},
+            "leaderboard": self._leaderboard(),
             "blobs": [
                 {
                     "id": blob.id,
@@ -665,3 +678,46 @@ class GameWorld:
                 for v in viruses
             ],
         }
+
+    def snapshot_for(self, player_id: str) -> dict | None:
+        player = self.players.get(player_id)
+        if player is None:
+            return None
+
+        cx, cy = player.center()
+        total_mass = max(player.total_mass, config.PLAYER_START_MASS)
+        split_count = max(0, len(player.blobs) - 1)
+        base_zoom = 1.52 - (total_mass ** 0.4) / 22.0
+        split_penalty = split_count * 0.055
+        zoom = _clamp(base_zoom - split_penalty, 0.24, 1.35)
+        view_w = config.VIEW_WIDTH / zoom + config.VIEW_PADDING
+        view_h = config.VIEW_HEIGHT / zoom + config.VIEW_PADDING
+
+        blobs, foods, ejected, viruses = self._visible_entities(cx, cy, view_w, view_h)
+        return self._snapshot_payload(
+            you=player.id,
+            player_name=player.name,
+            player_score=player.total_mass,
+            camera_x=cx,
+            camera_y=cy,
+            camera_zoom=zoom,
+            blobs=blobs,
+            foods=foods,
+            ejected=ejected,
+            viruses=viruses,
+        )
+
+    def snapshot_overview(self) -> dict:
+        zoom = min(config.VIEW_WIDTH / config.WORLD_WIDTH, config.VIEW_HEIGHT / config.WORLD_HEIGHT) * 0.92
+        return self._snapshot_payload(
+            you=None,
+            player_name="Spectator",
+            player_score=0.0,
+            camera_x=config.WORLD_WIDTH * 0.5,
+            camera_y=config.WORLD_HEIGHT * 0.5,
+            camera_zoom=_clamp(zoom, 0.05, 1.35),
+            blobs=[blob for player in self.players.values() for blob in player.blobs.values()],
+            foods=list(self.foods.values()),
+            ejected=list(self.ejected.values()),
+            viruses=list(self.viruses.values()),
+        )

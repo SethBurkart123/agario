@@ -3,6 +3,7 @@ const ctx = canvas.getContext("2d");
 const statusEl = document.getElementById("status");
 const scoreEl = document.getElementById("score");
 const leaderboardEl = document.getElementById("leaderboard");
+const overviewToggleEl = document.getElementById("overview-toggle");
 
 const BG_COLOR = "#F2FBFF";
 const GRID_COLOR = "#CDD4D7";
@@ -17,6 +18,8 @@ let ws;
 let world = { w: 6000, h: 6000 };
 let state = null;
 let playerId = null;
+let spectatorMode = false;
+let overviewMode = false;
 
 let splitQueued = false;
 let ejectQueued = false;
@@ -40,6 +43,11 @@ const nameKey = "agar-clone-name";
 const randomName = () => `Cell-${Math.floor(Math.random() * 900 + 100)}`;
 const playerName = localStorage.getItem(nameKey) || randomName();
 localStorage.setItem(nameKey, playerName);
+const pathIsOverview = window.location.pathname === "/overview";
+const queryOverview = new URLSearchParams(window.location.search).get("overview") === "1";
+const startInOverview = pathIsOverview || queryOverview;
+overviewMode = startInOverview;
+spectatorMode = startInOverview;
 
 function hashString(value) {
   let hash = 0;
@@ -88,6 +96,7 @@ window.addEventListener("mousemove", (evt) => {
 });
 
 window.addEventListener("keydown", (evt) => {
+  if (spectatorMode || overviewMode) return;
   if (evt.code === "Space") {
     if (!evt.repeat) splitQueued = true;
     evt.preventDefault();
@@ -97,6 +106,36 @@ window.addEventListener("keydown", (evt) => {
     evt.preventDefault();
   }
 });
+
+function updateOverviewButton() {
+  if (!overviewToggleEl) return;
+  if (spectatorMode) {
+    overviewToggleEl.textContent = "Spectator: Full Map";
+    overviewToggleEl.disabled = true;
+    return;
+  }
+  overviewToggleEl.disabled = false;
+  overviewToggleEl.textContent = overviewMode ? "Overview: On" : "Overview: Off";
+}
+
+function sendViewMode() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || spectatorMode || !playerId) return;
+  ws.send(
+    JSON.stringify({
+      type: "view_mode",
+      overview: overviewMode,
+    }),
+  );
+}
+
+if (overviewToggleEl) {
+  overviewToggleEl.addEventListener("click", () => {
+    if (spectatorMode) return;
+    overviewMode = !overviewMode;
+    updateOverviewButton();
+    sendViewMode();
+  });
+}
 
 function connect() {
   const protocol = location.protocol === "https:" ? "wss" : "ws";
@@ -108,6 +147,7 @@ function connect() {
       JSON.stringify({
         type: "join",
         name: playerName,
+        spectator: startInOverview,
       }),
     );
   });
@@ -116,9 +156,17 @@ function connect() {
     const data = JSON.parse(event.data);
 
     if (data.type === "welcome") {
-      playerId = data.playerId;
+      spectatorMode = Boolean(data.spectator);
+      playerId = data.playerId || null;
       world = data.world;
       serverInputHz = Math.max(20, Number(data.inputHz || 60));
+      updateOverviewButton();
+      if (spectatorMode) {
+        statusEl.textContent = "Connected as spectator";
+        scoreEl.textContent = "Spectator";
+      } else {
+        sendViewMode();
+      }
       return;
     }
 
@@ -127,8 +175,10 @@ function connect() {
       cameraTarget.x = state.camera.x;
       cameraTarget.y = state.camera.y;
       cameraTarget.zoom = state.camera.zoom;
-      scoreEl.textContent = `Score: ${state.player.score}`;
-      drawLeaderboard(state.leaderboard, state.player.name);
+      if (!spectatorMode) {
+        scoreEl.textContent = `Score: ${state.player.score}`;
+      }
+      drawLeaderboard(state.leaderboard, spectatorMode ? "" : state.player.name);
       syncBlobVisuals(state.blobs);
       syncConsumedEffects(state);
       return;
@@ -138,6 +188,8 @@ function connect() {
   ws.addEventListener("close", () => {
     statusEl.textContent = "Disconnected. Reconnecting...";
     playerId = null;
+    spectatorMode = false;
+    overviewMode = startInOverview;
     state = null;
     blobVisuals.clear();
     consumeFx.clear();
@@ -202,7 +254,7 @@ function syncBlobVisuals(blobs) {
 }
 
 function sendInput() {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !playerId) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !playerId || spectatorMode || overviewMode) {
     return;
   }
 
@@ -863,6 +915,7 @@ function render(nowMs) {
 }
 
 resize();
+updateOverviewButton();
 connect();
 setInterval(() => {
   if (ws?.readyState === WebSocket.OPEN) {
