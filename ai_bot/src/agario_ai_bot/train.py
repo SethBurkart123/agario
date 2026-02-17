@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import random
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -62,6 +63,7 @@ class SelfPlayTrainer:
         save_every: int,
         model_path: str,
         seed: int,
+        search_workers: int,
     ) -> None:
         self.settings = settings
         self.episodes = episodes
@@ -72,6 +74,7 @@ class SelfPlayTrainer:
         self.save_every = max(1, save_every)
         self.model_path = model_path
         self.seed = seed
+        self.search_workers = max(1, search_workers)
 
         random.seed(seed)
         np.random.seed(seed)
@@ -84,6 +87,7 @@ class SelfPlayTrainer:
         )
         self.device = create_device(settings.device_preference)
         self.search_device = create_device(settings.planner_device_preference)
+        self._configure_torch_backends()
         self.model = load_or_init_model(
             model_path=model_path,
             obs_size=OBSERVATION_SIZE,
@@ -111,45 +115,65 @@ class SelfPlayTrainer:
             device=self.search_device,
             settings=settings,
         )
+        if self.search_workers > 1 and self.search_device.type == "cpu":
+            self._search_pool: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=self.search_workers)
+        else:
+            self._search_pool = None
+            if self.search_workers > 1:
+                print(
+                    "search-workers>1 requested, but parallel search is only enabled when planner-device=cpu. "
+                    "Falling back to single-threaded search.",
+                    flush=True,
+                )
 
     def train(self) -> None:
         print(
             f"starting training episodes={self.episodes} players={self.num_players} "
-            f"sims={self.settings.simulations} device={self.device.type} planner_device={self.search_device.type}",
+            f"sims={self.settings.simulations} device={self.device.type} "
+            f"planner_device={self.search_device.type} search_workers={self.search_workers}",
             flush=True,
         )
-        episode_bar = tqdm(
-            range(1, self.episodes + 1),
-            desc="training",
-            dynamic_ncols=True,
-        )
-        for episode in episode_bar:
-            self._sync_search_model()
-            stats = self._run_episode(episode)
-            loss = self._run_updates()
-            if episode % self.save_every == 0:
-                save_model(self.model, self.model_path)
-                saved = "yes"
-            else:
-                saved = "no"
-            episode_bar.set_postfix(
-                buffer=len(self.replay),
-                mean_return=f"{stats['mean_return']:.3f}",
-                mean_mass=f"{stats['mean_mass']:.1f}",
-                loss=f"{loss:.4f}",
-                saved=saved,
+        try:
+            episode_bar = tqdm(
+                range(1, self.episodes + 1),
+                desc="training",
+                dynamic_ncols=True,
             )
-            print(
-                f"[episode {episode:04d}] "
-                f"buffer={len(self.replay)} "
-                f"mean_return={stats['mean_return']:.3f} "
-                f"mean_mass={stats['mean_mass']:.1f} "
-                f"loss={loss:.4f}"
-            )
+            for episode in episode_bar:
+                self._sync_search_model()
+                stats = self._run_episode(episode)
+                loss = self._run_updates()
+                if episode % self.save_every == 0:
+                    save_model(self.model, self.model_path)
+                    saved = "yes"
+                else:
+                    saved = "no"
+                episode_bar.set_postfix(
+                    buffer=len(self.replay),
+                    mean_return=f"{stats['mean_return']:.3f}",
+                    mean_mass=f"{stats['mean_mass']:.1f}",
+                    loss=f"{loss:.4f}",
+                    saved=saved,
+                )
+                print(
+                    f"[episode {episode:04d}] "
+                    f"buffer={len(self.replay)} "
+                    f"mean_return={stats['mean_return']:.3f} "
+                    f"mean_mass={stats['mean_mass']:.1f} "
+                    f"loss={loss:.4f}"
+                )
 
-        episode_bar.close()
-        save_model(self.model, self.model_path)
-        print(f"saved model to {self.model_path}")
+            episode_bar.close()
+            save_model(self.model, self.model_path)
+            print(f"saved model to {self.model_path}")
+        finally:
+            if self._search_pool is not None:
+                self._search_pool.shutdown(wait=True)
+
+    def _configure_torch_backends(self) -> None:
+        if self.device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cudnn.benchmark = True
 
     def _sync_search_model(self) -> None:
         if self.search_model is self.model:
@@ -183,22 +207,21 @@ class SelfPlayTrainer:
                 for pid in player_ids
                 if pid in world.players
             }
+            alive_pids = [pid for pid in player_ids if pid in world.players]
+            planned: list[tuple[str, tuple[float, float, bool, bool], np.ndarray, np.ndarray]] = []
+            if self._search_pool is not None and len(alive_pids) > 1:
+                futures = [
+                    self._search_pool.submit(self._plan_action, world, pid, now, dt)
+                    for pid in alive_pids
+                ]
+                for future in futures:
+                    planned.append(future.result())
+            else:
+                for pid in alive_pids:
+                    planned.append(self._plan_action(world, pid, now, dt))
 
-            for pid in player_ids:
-                if pid not in world.players:
-                    continue
-                result = self.planner.search(
-                    world=world,
-                    player_id=pid,
-                    now=now,
-                    dt=dt,
-                    training=True,
-                )
-                tx, ty, split, eject = self.planner.action_to_world_input(
-                    world=world,
-                    player_id=pid,
-                    action_index=result.action_index,
-                )
+            for pid, world_input, obs, pi in planned:
+                tx, ty, split, eject = world_input
                 world.set_input(
                     player_id=pid,
                     target_x=tx,
@@ -206,7 +229,7 @@ class SelfPlayTrainer:
                     split=split,
                     eject=eject,
                 )
-                actions[pid] = (result.obs_vector, result.visit_probs)
+                actions[pid] = (obs, pi)
 
             now += dt
             world.update(dt=dt, now=now)
@@ -240,6 +263,27 @@ class SelfPlayTrainer:
             "mean_return": float(np.mean(episode_returns)) if episode_returns else 0.0,
             "mean_mass": float(np.mean(final_masses)) if final_masses else 0.0,
         }
+
+    def _plan_action(
+        self,
+        world: GameWorld,
+        player_id: str,
+        now: float,
+        dt: float,
+    ) -> tuple[str, tuple[float, float, bool, bool], np.ndarray, np.ndarray]:
+        result = self.planner.search(
+            world=world,
+            player_id=player_id,
+            now=now,
+            dt=dt,
+            training=True,
+        )
+        tx, ty, split, eject = self.planner.action_to_world_input(
+            world=world,
+            player_id=player_id,
+            action_index=result.action_index,
+        )
+        return (player_id, (tx, ty, split, eject), result.obs_vector, result.visit_probs)
 
     def _run_updates(self) -> float:
         if len(self.replay) < self.batch_size:
@@ -288,6 +332,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "mps", "cuda"])
     parser.add_argument("--planner-device", type=str, default=None, choices=["cpu", "mps", "cuda"])
     parser.add_argument("--max-considered-actions", type=int, default=None)
+    parser.add_argument("--search-workers", type=int, default=1)
+    parser.add_argument("--gpu-rollout", dest="gpu_rollout", action="store_true")
+    parser.add_argument("--no-gpu-rollout", dest="gpu_rollout", action="store_false")
+    parser.set_defaults(gpu_rollout=None)
+    parser.add_argument("--gpu-rollout-food-limit", type=int, default=None)
+    parser.add_argument("--gpu-rollout-ejected-limit", type=int, default=None)
     return parser
 
 
@@ -304,6 +354,12 @@ def main() -> None:
         settings = replace(settings, planner_device_preference=args.planner_device)
     if args.max_considered_actions is not None:
         settings = replace(settings, max_considered_actions=max(4, args.max_considered_actions))
+    if args.gpu_rollout is not None:
+        settings = replace(settings, use_gpu_rollout=bool(args.gpu_rollout))
+    if args.gpu_rollout_food_limit is not None:
+        settings = replace(settings, gpu_rollout_food_limit=max(32, args.gpu_rollout_food_limit))
+    if args.gpu_rollout_ejected_limit is not None:
+        settings = replace(settings, gpu_rollout_ejected_limit=max(16, args.gpu_rollout_ejected_limit))
 
     model_path = str(Path(args.model_path))
     trainer = SelfPlayTrainer(
@@ -318,6 +374,7 @@ def main() -> None:
         save_every=args.save_every,
         model_path=model_path,
         seed=args.seed,
+        search_workers=max(1, args.search_workers),
     )
     trainer.train()
 

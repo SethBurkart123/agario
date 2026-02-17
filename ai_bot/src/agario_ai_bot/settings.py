@@ -34,6 +34,13 @@ def _env_str(name: str, default: str) -> str:
     return value if value else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True, slots=True)
 class AiBotSettings:
     model_path: str = "ai_bot/models/policy_value.pt"
@@ -51,6 +58,9 @@ class AiBotSettings:
     train_decision_temperature: float = 1.0
     runtime_decision_interval: float = 1.0 / 12.0
     max_considered_actions: int = 24
+    use_gpu_rollout: bool = True
+    gpu_rollout_food_limit: int = 512
+    gpu_rollout_ejected_limit: int = 128
 
     @classmethod
     def from_env(cls) -> AiBotSettings:
@@ -85,5 +95,14 @@ class AiBotSettings:
             max_considered_actions=max(
                 4,
                 _env_int("AGARIO_AI_BOT_MAX_CONSIDERED_ACTIONS", defaults.max_considered_actions),
+            ),
+            use_gpu_rollout=_env_bool("AGARIO_AI_BOT_USE_GPU_ROLLOUT", defaults.use_gpu_rollout),
+            gpu_rollout_food_limit=max(
+                32,
+                _env_int("AGARIO_AI_BOT_GPU_ROLLOUT_FOOD_LIMIT", defaults.gpu_rollout_food_limit),
+            ),
+            gpu_rollout_ejected_limit=max(
+                16,
+                _env_int("AGARIO_AI_BOT_GPU_ROLLOUT_EJECTED_LIMIT", defaults.gpu_rollout_ejected_limit),
             ),
         )

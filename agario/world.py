@@ -29,6 +29,21 @@ def _unit_vec(dx: float, dy: float) -> tuple[float, float]:
     return (dx * inv_mag, dy * inv_mag)
 
 
+def _next_counter_value(ids: list[str], prefix: str) -> int:
+    max_seen = 0
+    plen = len(prefix)
+    for raw in ids:
+        if not raw.startswith(prefix):
+            continue
+        try:
+            value = int(raw[plen:])
+        except ValueError:
+            continue
+        if value > max_seen:
+            max_seen = value
+    return max_seen + 1
+
+
 class GameWorld:
     def __init__(self, seed: int | None = None) -> None:
         self.rng = random.Random(seed)
@@ -65,6 +80,84 @@ class GameWorld:
         self.food_hash = SpatialHash(150.0)
         self.blob_hash = SpatialHash(250.0)
         self.ejected_hash = SpatialHash(180.0)
+
+    def fast_clone(self) -> GameWorld:
+        """Clone world state for short rollout simulations faster than deepcopy."""
+        clone = GameWorld.__new__(GameWorld)
+        clone.rng = random.Random()
+        clone.rng.setstate(self.rng.getstate())
+
+        clone.players = {}
+        blob_ids: list[str] = []
+        for player in self.players.values():
+            copied = Player(
+                id=player.id,
+                name=player.name,
+                color=player.color,
+                is_bot=player.is_bot,
+                bot_plugin=player.bot_plugin,
+                bot_team=player.bot_team,
+            )
+            copied.target_x = player.target_x
+            copied.target_y = player.target_y
+            copied.split_requested = player.split_requested
+            copied.eject_requested = player.eject_requested
+            copied.last_split_at = player.last_split_at
+            copied.last_eject_at = player.last_eject_at
+
+            copied.blobs = {}
+            for blob in player.blobs.values():
+                copied_blob = Blob(
+                    id=blob.id,
+                    player_id=blob.player_id,
+                    x=blob.x,
+                    y=blob.y,
+                    mass=blob.mass,
+                    vx=blob.vx,
+                    vy=blob.vy,
+                    can_merge_at=blob.can_merge_at,
+                )
+                copied.blobs[copied_blob.id] = copied_blob
+                blob_ids.append(copied_blob.id)
+            clone.players[copied.id] = copied
+
+        clone.foods = {
+            food.id: Food(id=food.id, x=food.x, y=food.y, mass=food.mass, color=food.color)
+            for food in self.foods.values()
+        }
+        clone.ejected = {
+            e.id: EjectedMass(
+                id=e.id,
+                x=e.x,
+                y=e.y,
+                mass=e.mass,
+                owner_id=e.owner_id,
+                vx=e.vx,
+                vy=e.vy,
+                ttl=e.ttl,
+            )
+            for e in self.ejected.values()
+        }
+        clone.viruses = {
+            v.id: Virus(id=v.id, x=v.x, y=v.y, mass=v.mass)
+            for v in self.viruses.values()
+        }
+
+        player_ids = list(clone.players.keys())
+        food_ids = list(clone.foods.keys())
+        ejected_ids = list(clone.ejected.keys())
+        virus_ids = list(clone.viruses.keys())
+
+        clone._player_ids = count(_next_counter_value(player_ids, "p"))
+        clone._blob_ids = count(_next_counter_value(blob_ids, "b"))
+        clone._food_ids = count(_next_counter_value(food_ids, "f"))
+        clone._ejected_ids = count(_next_counter_value(ejected_ids, "e"))
+        clone._virus_ids = count(_next_counter_value(virus_ids, "v"))
+
+        clone.food_hash = SpatialHash(150.0)
+        clone.blob_hash = SpatialHash(250.0)
+        clone.ejected_hash = SpatialHash(180.0)
+        return clone
 
     def _next_player_id(self) -> str:
         return f"p{next(self._player_ids)}"

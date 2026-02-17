@@ -17,6 +17,7 @@ from agario import config
 from agario.world import GameWorld
 
 from .action_space import ActionSpace
+from .gpu_rollout import GpuRolloutSimulator
 from .model import PolicyValueNet
 from .observation import build_observation
 from .settings import AiBotSettings
@@ -52,6 +53,11 @@ class PUCTPlanner:
         self.action_space = action_space
         self.device = device
         self.settings = settings
+        self.gpu_rollout = (
+            GpuRolloutSimulator(action_space=action_space, settings=settings, device=device)
+            if settings.use_gpu_rollout and device.type == "cuda"
+            else None
+        )
 
     def search(
         self,
@@ -84,6 +90,19 @@ class PUCTPlanner:
         visits = np.zeros(self.action_space.size, dtype=np.float32)
         q_values = np.zeros(self.action_space.size, dtype=np.float32)
         evaluated = np.zeros(self.action_space.size, dtype=bool)
+
+        if self.gpu_rollout is not None:
+            candidate_indices = np.flatnonzero(candidate_mask)
+            candidate_values = self.gpu_rollout.evaluate(
+                world=world,
+                player_id=player_id,
+                now=now,
+                dt=dt,
+                action_indices=candidate_indices.astype(np.int64, copy=False),
+            )
+            if candidate_indices.size > 0:
+                q_values[candidate_indices] = candidate_values
+                evaluated[candidate_indices] = True
 
         for _ in range(self.settings.simulations):
             total_visits = float(np.sum(visits))
@@ -158,7 +177,10 @@ class PUCTPlanner:
         now: float,
         dt: float,
     ) -> float:
-        world_copy: GameWorld = copy.deepcopy(world)
+        if hasattr(world, "fast_clone"):
+            world_copy = world.fast_clone()
+        else:
+            world_copy = copy.deepcopy(world)
         player_before = world_copy.players.get(player_id)
         if player_before is None:
             return -1.0
