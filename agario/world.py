@@ -252,6 +252,7 @@ class GameWorld:
         self._resolve_blob_ejected_collisions()
         self._resolve_blob_blob_collisions(now)
         self._resolve_virus_blob_collisions(now)
+        self._apply_mass_decay(dt)
 
         self._spawn_food_to_target()
         self._rebuild_spatial_indexes()
@@ -426,6 +427,33 @@ class GameWorld:
                 blob.x = _clamp(blob.x, clamp_r, config.WORLD_WIDTH - clamp_r)
                 blob.y = _clamp(blob.y, clamp_r, config.WORLD_HEIGHT - clamp_r)
 
+    def _mass_decay_rate(self, total_mass: float) -> float:
+        if total_mass <= config.MASS_DECAY_START:
+            return config.MASS_DECAY_MIN_RATE
+        if total_mass >= config.MASS_DECAY_END:
+            return config.MASS_DECAY_MAX_RATE
+        span = config.MASS_DECAY_END - config.MASS_DECAY_START
+        if span <= 0.0:
+            return config.MASS_DECAY_MAX_RATE
+        t = _clamp((total_mass - config.MASS_DECAY_START) / span, 0.0, 1.0)
+        eased = t ** max(0.05, config.MASS_DECAY_CURVE)
+        return config.MASS_DECAY_MIN_RATE + (config.MASS_DECAY_MAX_RATE - config.MASS_DECAY_MIN_RATE) * eased
+
+    def _apply_mass_decay(self, dt: float) -> None:
+        if dt <= 0.0:
+            return
+        for player in self.players.values():
+            if not player.blobs:
+                continue
+            rate = self._mass_decay_rate(player.total_mass)
+            if rate <= 0.0:
+                continue
+            for blob in player.blobs.values():
+                if blob.mass <= config.MIN_BLOB_MASS:
+                    continue
+                decayed = blob.mass - blob.mass * rate * dt
+                blob.mass = max(config.MIN_BLOB_MASS, decayed)
+
     def _apply_same_player_softbody(self, player: Player, now: float) -> None:
         blobs = list(player.blobs.values())
         if len(blobs) <= 1:
@@ -450,9 +478,10 @@ class GameWorld:
                 touch = a.radius + b.radius
                 ready_to_merge = now >= a.can_merge_at and now >= b.can_merge_at
 
-                min_dist = touch * (
-                    config.SOFTBODY_MIN_DIST_MERGED if ready_to_merge else config.SOFTBODY_MIN_DIST_UNMERGED
-                )
+                if ready_to_merge:
+                    min_dist = touch * config.SOFTBODY_MIN_DIST_MERGED
+                else:
+                    min_dist = touch
 
                 # Keep blobs from collapsing into one center; this preserves the squishy contact feel.
                 if dist < min_dist:
@@ -592,7 +621,10 @@ class GameWorld:
                 if bigger.player_id == smaller.player_id:
                     if now < bigger.can_merge_at or now < smaller.can_merge_at:
                         continue
-                    if dist_sq <= (max(bigger.radius, smaller.radius) * 0.35) ** 2:
+                    merge_distance = bigger.radius - smaller.radius * config.MERGE_COVERAGE_FRACTION
+                    if merge_distance <= 0.0:
+                        continue
+                    if dist_sq <= merge_distance * merge_distance:
                         bigger.mass += smaller.mass
                         eaten_blob_ids.add(smaller.id)
                     continue
@@ -781,7 +813,7 @@ class GameWorld:
         total_mass = max(player.total_mass, config.PLAYER_START_MASS)
         split_count = max(0, len(player.blobs) - 1)
         base_zoom = 1.52 - (total_mass ** 0.4) / 22.0
-        split_penalty = split_count * 0.055
+        split_penalty = config.SPLIT_ZOOM_MAX_PENALTY * (1.0 - exp(-config.SPLIT_ZOOM_DECAY * split_count))
         zoom = _clamp(base_zoom - split_penalty, 0.24, 1.35)
         view_w = config.VIEW_WIDTH / zoom + config.VIEW_PADDING
         view_h = config.VIEW_HEIGHT / zoom + config.VIEW_PADDING

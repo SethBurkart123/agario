@@ -12,7 +12,7 @@ const VIRUS_BORDER = "#2EE52C";
 const PLAYER_BORDER_WORLD = 5.6;
 const VIRUS_BORDER_WORLD = 8.0;
 const EJECTED_BORDER_WORLD = 2.2;
-const VIRUS_SPIKE_SPACING_WORLD = 9.6;
+const VIRUS_SPIKE_SPACING_WORLD = 6.0;
 
 let ws;
 let world = { w: 6000, h: 6000 };
