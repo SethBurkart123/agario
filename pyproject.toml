@@ -12,6 +12,17 @@ dependencies = [
 [project.scripts]
 agario = "main:main"
 
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["agario*"]
+namespaces = false
+
 [tool.uv.workspace]
 members = [
     "ai_bot",
