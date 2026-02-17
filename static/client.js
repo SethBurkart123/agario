@@ -575,6 +575,7 @@ function pruneInteractors(list, maxCount = 16) {
 function buildBlobInteractors(blob, allBlobs, viruses) {
   const list = [];
   const r = worldRadius(blob);
+  const largeBlobDamp = 1 - clamp((r - 30) / 180, 0, 0.3);
 
   for (const other of allBlobs) {
     if (other.id === blob.id) continue;
@@ -590,7 +591,12 @@ function buildBlobInteractors(blob, allBlobs, viruses) {
     const closeness = clamp((near - dist) / near, 0, 1);
     const overlap = clamp((touch - dist) / touch, 0, 1);
     const samePlayer = other.playerId === blob.playerId ? 1.36 : 0.82;
-    const strength = (closeness * 0.58 + overlap * 1.72) * samePlayer;
+    const relative = r2 / Math.max(1, r);
+    const sizeInfluence =
+      relative < 1
+        ? clamp(Math.pow(relative, 1.25), 0.14, 1.0)
+        : clamp(1 + (relative - 1) * 0.22, 1.0, 1.24);
+    const strength = (closeness * 0.58 + overlap * 1.72) * samePlayer * sizeInfluence * largeBlobDamp;
     pushInteractor(list, dx, dy, strength);
   }
 
@@ -605,7 +611,9 @@ function buildBlobInteractors(blob, allBlobs, viruses) {
 
     const closeness = clamp((near - dist) / near, 0, 1);
     const overlap = clamp((touch - dist) / touch, 0, 1);
-    const strength = closeness * 0.7 + overlap * 1.26;
+    const relativeVirus = rv / Math.max(1, r);
+    const virusSizeInfluence = clamp(Math.pow(relativeVirus, 0.95), 0.22, 1.0);
+    const strength = (closeness * 0.7 + overlap * 1.26) * virusSizeInfluence * largeBlobDamp;
     pushInteractor(list, dx, dy, strength);
   }
 
@@ -698,9 +706,12 @@ function sampleIngestBulge(nx, ny, ingestors) {
 
 function drawBlobShape(blob, timeSec, allBlobs, viruses, foods, ejected) {
   const center = toScreen(blob.x, blob.y);
-  const radius = worldRadius(blob) * camera.zoom;
+  const worldR = worldRadius(blob);
+  const radius = worldR * camera.zoom;
   const interactors = buildBlobInteractors(blob, allBlobs, viruses);
   const ingestors = buildBlobIngestors(blob, foods, ejected);
+  const deformScale = 1 - clamp((worldR - 24) / 170, 0, 0.34);
+  const minRadiusFactor = 0.58 + clamp((worldR - 22) / 220, 0, 0.1);
 
   const speed = Math.hypot(blob.vx, blob.vy);
   const speedNorm = clamp(speed / 520, 0, 1);
@@ -726,17 +737,17 @@ function drawBlobShape(blob, timeSec, allBlobs, viruses, foods, ejected) {
 
     const stretch =
       1 +
-      moveDot * speedNorm * 0.055 -
-      pressure.indent * 0.31 +
-      pressure.bulge * 0.06 +
-      ingest * 0.16;
+      moveDot * speedNorm * (0.055 * (0.8 + deformScale * 0.2)) -
+      pressure.indent * (0.31 * deformScale) +
+      pressure.bulge * (0.06 * (0.86 + deformScale * 0.14)) +
+      ingest * (0.16 * (0.7 + deformScale * 0.3));
     const wobbleAmp =
-      radius * (0.008 + speedNorm * 0.008 + Math.min(1.0, pressure.indent) * 0.011);
+      radius * (0.008 + speedNorm * 0.008 + Math.min(1.0, pressure.indent) * 0.011) * (0.7 + deformScale * 0.3);
     const wobbleA = Math.sin(timeSec * 7.2 + i * 0.92 + blob.seed * 11.7);
     const wobbleB = Math.sin(timeSec * 11.2 - i * 1.21 + blob.seed * 5.4);
     const wobble = (wobbleA * 0.62 + wobbleB * 0.38) * wobbleAmp;
 
-    const localRadius = Math.max(radius * 0.58, radius * stretch + wobble);
+    const localRadius = Math.max(radius * minRadiusFactor, radius * stretch + wobble);
     const x = center.x + nx * localRadius;
     const y = center.y + ny * localRadius;
 
