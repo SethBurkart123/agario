@@ -1,0 +1,2 @@
+[console_scripts]
+agario = main:main
