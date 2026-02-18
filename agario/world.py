@@ -813,7 +813,13 @@ class GameWorld:
         total_mass = max(player.total_mass, config.PLAYER_START_MASS)
         split_count = max(0, len(player.blobs) - 1)
         base_zoom = 1.52 - (total_mass ** 0.4) / 22.0
-        split_penalty = config.SPLIT_ZOOM_MAX_PENALTY * (1.0 - exp(-config.SPLIT_ZOOM_DECAY * split_count))
+        max_penalty = config.SPLIT_ZOOM_MAX_PENALTY
+        mass_span = config.SPLIT_ZOOM_MASS_HARD_CAP - config.SPLIT_ZOOM_MASS_SOFT_CAP
+        if mass_span > 0.0:
+            mass_t = _clamp((total_mass - config.SPLIT_ZOOM_MASS_SOFT_CAP) / mass_span, 0.0, 1.0)
+            mass_factor = mass_t ** max(0.1, config.SPLIT_ZOOM_MASS_CURVE)
+            max_penalty += (config.SPLIT_ZOOM_MAX_PENALTY_HUGE - max_penalty) * mass_factor
+        split_penalty = max_penalty * (1.0 - exp(-config.SPLIT_ZOOM_DECAY * split_count))
         zoom = _clamp(base_zoom - split_penalty, 0.24, 1.35)
         view_w = config.VIEW_WIDTH / zoom + config.VIEW_PADDING
         view_h = config.VIEW_HEIGHT / zoom + config.VIEW_PADDING
