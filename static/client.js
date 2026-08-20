@@ -4,7 +4,7 @@ const statusEl = document.getElementById("status");
 const scoreEl = document.getElementById("score");
 const leaderboardEl = document.getElementById("leaderboard");
 
-const BG_COLOR = "#F2FBFF";
+const BG_COLOR = "#F4FBFF";
 const GRID_COLOR = "#CDD4D7";
 const VIRUS_FILL = "#34FF32";
 const VIRUS_BORDER = "#2EE52C";
@@ -13,7 +13,7 @@ const VIRUS_BORDER_WORLD = 10;
 const EJECTED_BORDER_WORLD = 2.2;
 const VIRUS_SPIKE_SPACING_WORLD = 6.0;
 const SNAPSHOT_BLEND_MS = 120;
-const CLIENT_PROTOCOL = 2;
+const CLIENT_PROTOCOL = 3;
 
 let ws;
 let world = { w: 14142.135623730952, h: 14142.135623730952 };
@@ -327,13 +327,14 @@ function toScreen(x, y) {
 
 function drawGrid() {
   const cell = 50 * camera.zoom;
+  const detail = clamp((camera.zoom - 0.3) / 0.7, 0, 1);
 
   const xMinor = ((-camera.x * camera.zoom + window.innerWidth / 2) % cell + cell) % cell;
   const yMinor = ((-camera.y * camera.zoom + window.innerHeight / 2) % cell + cell) % cell;
 
   ctx.strokeStyle = "#000000";
-  ctx.globalAlpha = 0.2;
-  ctx.lineWidth = 1;
+  ctx.globalAlpha = 0.12 + detail * 0.05;
+  ctx.lineWidth = 0.4 + detail * 0.6;
   for (let x = xMinor; x <= window.innerWidth; x += cell) {
     ctx.beginPath();
     ctx.moveTo(x, 0);
@@ -415,7 +416,7 @@ function drawFood(nowMs) {
     }
 
     const p = toScreen(food.x, food.y);
-    const radius = Math.max(3, Math.sqrt(food.mass * 100) * camera.zoom);
+    const radius = Math.max(5, Math.sqrt(food.mass * 100) * camera.zoom);
 
     traceWobblingDisk(p.x, p.y, radius, food.id, nowMs / 1000);
     ctx.fillStyle = food.color;
@@ -542,7 +543,7 @@ function drawConsumeFx(dt) {
     const p = toScreen(fx.x, fx.y);
     const radiusBase =
       fx.kind === "food"
-        ? Math.max(3, Math.sqrt(fx.mass * 100) * camera.zoom)
+        ? Math.max(5, Math.sqrt(fx.mass * 100) * camera.zoom)
         : Math.max(3.5, Math.sqrt(fx.mass * 100) * camera.zoom);
     const radius = radiusBase;
     ctx.globalAlpha = alpha;

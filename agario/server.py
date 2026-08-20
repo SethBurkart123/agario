@@ -17,7 +17,7 @@ from . import config
 from .bots.manager import BotManager
 
 MECHANICS = mechanics()
-CLIENT_PROTOCOL = 2
+CLIENT_PROTOCOL = 3
 
 
 class RealtimeServer:
