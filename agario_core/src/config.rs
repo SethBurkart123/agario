@@ -75,7 +75,8 @@ impl Default for WorldConfig {
             virus_feed_times: 7,
             virus_split_boost: 780.0,
 
-            player_start_mass: 10.24,
+            // Match the signed-in FFA state used by the visual references.
+            player_start_mass: 21.0,
             player_min_mass: 10.24,
             player_max_mass: 22_500.0,
             player_min_split_mass: 36.0,
