@@ -108,12 +108,19 @@ window.addEventListener("keydown", (evt) => {
 });
 
 function connect() {
+  if (
+    ws &&
+    (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)
+  ) {
+    return;
+  }
   const protocol = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${protocol}://${location.host}/ws`);
+  const socket = new WebSocket(`${protocol}://${location.host}/ws`);
+  ws = socket;
 
-  ws.addEventListener("open", () => {
+  socket.addEventListener("open", () => {
     statusEl.textContent = `Connected as ${playerName}`;
-    ws.send(
+    socket.send(
       JSON.stringify({
         type: "join",
         name: playerName,
@@ -123,7 +130,7 @@ function connect() {
     );
   });
 
-  ws.addEventListener("message", (event) => {
+  socket.addEventListener("message", (event) => {
     const data = JSON.parse(event.data);
 
     if (data.type === "reload") {
@@ -160,7 +167,9 @@ function connect() {
     }
   });
 
-  ws.addEventListener("close", () => {
+  socket.addEventListener("close", () => {
+    if (ws !== socket) return;
+    ws = null;
     statusEl.textContent = "Disconnected. Reconnecting...";
     playerId = null;
     spectatorMode = false;
@@ -174,9 +183,10 @@ function connect() {
     setTimeout(connect, 1000);
   });
 
-  ws.addEventListener("error", () => {
+  socket.addEventListener("error", () => {
+    if (ws !== socket) return;
     statusEl.textContent = "Connection error";
-    ws.close();
+    socket.close();
   });
 }
 
