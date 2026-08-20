@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import hypot
+from math import hypot, sqrt
 
 from agario.bots.types import BlobView, BotAction, BotContext, BotInitContext, VirusView
 from agario_core import mechanics
 
 from . import (
     EAT_MASS_RATIO,
+    EAT_OVERLAP,
     MAX_BLOBS,
     MIN_BLOB_MASS,
+    MIN_SPLIT_MASS,
+    SPLIT_BOOST,
+    SPLIT_DISTANCE,
     VIRUS_MASS,
     SoloSmartBrain,
     _best_prey,
@@ -88,6 +92,35 @@ class SoloSmartV2Brain(SoloSmartBrain):
                 best = (player, enemy, dist, gap)
                 best_gap = gap
         return best
+
+    @staticmethod
+    def _split_intercepted(
+        ctx: BotContext, x: float, y: float, child_mass: float, ignore_id: str = ""
+    ) -> bool:
+        child_radius = sqrt(child_mass * 100.0)
+        for _, enemy in _iter_enemy_blobs(ctx):
+            if enemy.id == ignore_id:
+                continue
+            distance = hypot(enemy.x - x, enemy.y - y)
+            whole_reach = enemy.radius - child_radius * EAT_OVERLAP + 120.0
+            whole_eat = _can_eat(enemy.mass, child_mass) and distance < whole_reach
+            counter_reach = (
+                SPLIT_DISTANCE
+                + SPLIT_BOOST
+                + enemy.radius / sqrt(2.0)
+                - child_radius * EAT_OVERLAP
+            )
+            counter_split = (
+                enemy.mass * 0.5 > child_mass * EAT_MASS_RATIO
+                and distance < counter_reach
+            )
+            if whole_eat or counter_split:
+                return True
+        return False
+
+    def _block_split(self, ctx: BotContext, action: BotAction) -> BotAction:
+        self._stat(ctx, "unsafe_splits_blocked")
+        return BotAction(action.target_x, action.target_y, eject=action.eject)
 
     def _pursuit_age(
         self, ctx: BotContext, threat: BlobView | None, me: BlobView
@@ -231,26 +264,34 @@ class SoloSmartV2Brain(SoloSmartBrain):
     def _refine_split(
         self, ctx: BotContext, me: BlobView, action: BotAction
     ) -> BotAction:
-        if not action.split or ctx.memory.get("mode") != "attack":
+        if not action.split:
             return action
+        if ctx.memory.get("mode") != "attack":
+            return self._block_split(ctx, action)
+
         _, prey, _, dist = _best_prey(ctx, me, me.x, me.y)
         if prey is None:
-            self._stat(ctx, "unsafe_splits_blocked")
-            return BotAction(action.target_x, action.target_y, eject=action.eject)
-        predictable = hypot(prey.vx, prey.vy) < 38.0
-        near_wall = (
-            min(prey.x, prey.y, ctx.world_width - prey.x, ctx.world_height - prey.y)
-            < 330.0
+            return self._block_split(ctx, action)
+
+        post_mass = me.mass * 0.5
+        future_count = len(ctx.me.blobs) + sum(
+            blob.mass >= MIN_SPLIT_MASS for blob in ctx.me.blobs
         )
-        close = dist < me.radius * 2.0 + prey.radius * 1.2
-        safe = me.mass * 0.5 > prey.mass * EAT_MASS_RATIO and dist < _split_eat_reach(
-            me, prey
+        split_x, split_y = _unit(prey.x - me.x, prey.y - me.y)
+        landing_x = me.x + split_x * min(650.0, dist)
+        landing_y = me.y + split_y * min(650.0, dist)
+        countered = self._split_intercepted(
+            ctx, landing_x, landing_y, post_mass, ignore_id=prey.id
         )
-        if not safe or (
-            not close and not near_wall and not predictable and self.aggression < 1.28
+        minimum_reward = 0.16 + self.caution * 0.025 - self.aggression * 0.02
+        if (
+            future_count > 8
+            or post_mass <= prey.mass * EAT_MASS_RATIO
+            or dist >= _split_eat_reach(me, prey)
+            or prey.mass / me.mass <= minimum_reward
+            or countered
         ):
-            self._stat(ctx, "unsafe_splits_blocked")
-            return BotAction(action.target_x, action.target_y, eject=action.eject)
+            return self._block_split(ctx, action)
         self._stat(ctx, "split_attacks")
         return action
 
@@ -280,6 +321,60 @@ class SoloSmartV2Brain(SoloSmartBrain):
             split=action.split,
             eject=action.eject,
         )
+
+    def _split_farm(
+        self, ctx: BotContext, me: BlobView, action: BotAction
+    ) -> BotAction:
+        if (
+            ctx.memory.get("mode") != "farm"
+            or action.split
+            or ctx.me.total_mass > 340.0
+            or len(ctx.me.blobs) >= 8
+            or me.mass < MIN_SPLIT_MASS
+            or ctx.now < float(ctx.memory.get("next_farm_split_check_at", 0.0))
+        ):
+            return action
+        ctx.memory["next_farm_split_check_at"] = ctx.now + 0.45
+
+        future_count = len(ctx.me.blobs) + sum(
+            blob.mass >= MIN_SPLIT_MASS for blob in ctx.me.blobs
+        )
+        if future_count > 8:
+            return action
+
+        post_split_mass = min(
+            blob.mass * 0.5 if blob.mass >= MIN_SPLIT_MASS else blob.mass
+            for blob in ctx.me.blobs
+        )
+        ux, uy = _unit(action.target_x - me.x, action.target_y - me.y)
+        landing_x = me.x + ux * 650.0
+        landing_y = me.y + uy * 650.0
+        danger_range = 760.0 + self.caution * 280.0
+        if any(
+            _can_eat(enemy.mass, post_split_mass)
+            and min(
+                hypot(enemy.x - me.x, enemy.y - me.y),
+                hypot(enemy.x - landing_x, enemy.y - landing_y),
+            )
+            < danger_range + enemy.radius
+            for _, enemy in _iter_enemy_blobs(ctx)
+        ):
+            return action
+
+        food_mass = 0.0
+        for food in ctx.foods:
+            dx, dy = food.x - me.x, food.y - me.y
+            forward = dx * ux + dy * uy
+            if 0.0 < forward < 950.0 and abs(dx * uy - dy * ux) < (
+                140.0 + forward * 0.16
+            ):
+                food_mass += food.mass
+        if food_mass < 4.2 / self.greed:
+            return action
+
+        ctx.memory["next_farm_split_check_at"] = ctx.now + self.rng.uniform(1.0, 1.5)
+        self._stat(ctx, "farm_splits")
+        return BotAction(action.target_x, action.target_y, split=True)
 
     def decide(self, ctx: BotContext) -> BotAction:
         me = _largest_blob(ctx.me)
@@ -364,6 +459,8 @@ class SoloSmartV2Brain(SoloSmartBrain):
         ):
             self._stat(ctx, "recovery_splits_blocked")
             action = BotAction(action.target_x, action.target_y, eject=action.eject)
+
+        action = self._split_farm(ctx, me, action)
 
         if ctx.me.total_mass < 150.0 and ctx.memory.get("mode") == "farm":
             margin = min(me.x, me.y, ctx.world_width - me.x, ctx.world_height - me.y)
