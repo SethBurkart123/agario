@@ -116,6 +116,17 @@ Combined:
 AGARIO_BOT_SPECS="solo_smart:16"
 ```
 
+Use the stateful second-generation solo bot on its own or beside the original:
+
+```bash
+AGARIO_BOT_SPECS="solo_smart:8,solo_smart_v2:8" uv run python main.py
+uv run python -m tools.battle_bots --seconds 180 --seeds 1337 2027 4099
+```
+
+`solo_smart_v2` cycles through guardian, hunter, trickster, and grazer trait
+profiles. Add `--start-mass 400` to the battle command to stress split combat,
+virus play, and fragmented recovery immediately.
+
 ### Dynamic bot scaling
 
 By default, when a bot is eliminated, new bots are spawned (up to a cap) so matches can ramp in difficulty.

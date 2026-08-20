@@ -537,8 +537,8 @@ class SoloSmartBrain:
         if not cached:
             return None
         try:
-            tx, ty, split, eject = cached
-            return BotAction(float(tx), float(ty), bool(split), bool(eject))
+            tx, ty = cached
+            return BotAction(float(tx), float(ty))
         except Exception:
             return None
 
@@ -572,12 +572,7 @@ class SoloSmartBrain:
         ctx.memory["aim_y"] = target_y
 
         final_action = BotAction(target_x=target_x, target_y=target_y, split=action.split, eject=action.eject)
-        ctx.memory["last_action"] = (
-            float(final_action.target_x),
-            float(final_action.target_y),
-            bool(final_action.split),
-            bool(final_action.eject),
-        )
+        ctx.memory["last_action"] = (float(final_action.target_x), float(final_action.target_y))
         self._schedule_next_think(ctx, mode=mode, emergency=emergency)
         return final_action
 
@@ -1028,8 +1023,11 @@ class TeamSwarmBrain:
 
 
 def register(registry: BotRegistry) -> None:
+    from .solo_v2 import SoloSmartV2Brain
+
     registry.register("solo_smart", lambda init_ctx: SoloSmartBrain(init_ctx))
     registry.register("solo", lambda init_ctx: SoloSmartBrain(init_ctx))
+    registry.register("solo_smart_v2", lambda init_ctx: SoloSmartV2Brain(init_ctx))
     registry.register("forager", lambda init_ctx: ForagerBrain(init_ctx))
     registry.register("predator", lambda init_ctx: PredatorBrain(init_ctx))
     registry.register("team_swarm", lambda init_ctx: TeamSwarmBrain(init_ctx))
