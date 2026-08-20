@@ -11,6 +11,7 @@ Status: passed
 - Full large-state comparison: `/Users/sethburkart/.t3/userdata/browser-artifacts/agario-large-qa-side-by-side.png`.
 - Focused grid/pellet comparison: `/Users/sethburkart/.t3/userdata/browser-artifacts/agario-large-qa-focus.png`.
 - Small comparison: `/Users/sethburkart/.t3/userdata/browser-artifacts/agario-qa-side-by-side.png`.
+- Focused grid-softness comparison: `/Users/sethburkart/.t3/userdata/browser-artifacts/agario-grid-softness-final.png`.
 - Normalized large viewport: 1526 x 1002 CSS px at device scale factor 2. Source and implementation content are both 3052 x 2004 physical px.
 - Normalized small viewport: 1528 x 1017 CSS px at device scale factor 2. Source and implementation content are both 3056 x 2034 physical px.
 - The large QA world spawned at mass 675 and reached 16 cells. Its centered input leaves the pieces overlapped, so entity positions and cluster silhouette are not used as renderer measurements.
@@ -23,6 +24,8 @@ Status: passed
 | P1 | The dense zoomed-out grid dominated the scene. | Before the fix, 17.47% of neutral-region pixels exceeded the visible-line darkness threshold; live Agar.io measured 7.76%. | Grid opacity and width now soften with zoom. Final share is 7.39%; mean line-region darkness is 4.90 versus 4.73 in the source. |
 | P2 | The field color was slightly too cyan. | Implementation used `#f2fbff`; sampled live Agar.io background is `#f4fbff`. | Canvas and CSS field colors now use `#f4fbff`. |
 | P2 | A global soft-grid fix made the small state too faint. | The first iteration used the zoomed-out 0.12 alpha and 0.5 px width at every scale. | Grid detail now interpolates from 0.12 alpha / 0.4 px width when zoomed out to 0.17 alpha / 1 px width at normal scale. Small-state line-core color is `[203, 209, 213]` versus source `[204, 209, 212]`. |
+| P2 | Grid contrast matched in aggregate, but its raster edge still looked harder than live Agar.io. | The supplied close-up showed the line energy falling off across adjacent pixels rather than ending at the antialiased stroke edge. | A grid-only 0.45 CSS px blur now spreads the stroke without blurring food, cells, names, or the HUD. At normalized CSS resolution, line-spread sigma is 0.602 px versus 0.603 px in live Agar.io. |
+| — | Food density looked inconsistent between individual frames. | A single zoomed-out pair differed heavily, but local consumption and random placement make one frame unreliable. | Across all supplied full screenshots, live Agar.io ranges from 1.47 to 6.17 food pellets per 100 grid cells and the simulator ranges from 1.78 to 5.93. The averages differ by about 5%, so the global food target remains unchanged. |
 
 ## Quantitative checks
 
@@ -34,6 +37,7 @@ Status: passed
 | Large-state visibly dark grid share | 7.76% | 17.47% | 7.39% | 0.37 percentage-point difference |
 | Small-state grid cadence | 94 physical px | 94 px | 94 px | exact |
 | Small-state grid line core RGB | `[204, 209, 212]` | `[193, 200, 204]` | `[203, 209, 213]` | within 1 channel value |
+| Normalized grid line-spread sigma | 0.603 px | 0.638 px | 0.602 px | 0.2% difference |
 | Field RGB | `[244, 251, 255]` | `[242, 251, 255]` | `[244, 251, 255]` | exact |
 
 ## Required fidelity surfaces
