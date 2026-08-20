@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
 
 bot_solutions/rl_v1/checkpoints/
 agario_core/target/

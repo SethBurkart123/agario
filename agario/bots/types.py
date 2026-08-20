@@ -15,12 +15,11 @@ class BlobView:
     y: float
     mass: float
     radius: float
-    # Observed velocity (world units/sec). Populated by the Rust engine;
-    # zero when running the Python reference engine.
+    # Observed velocity in world units/sec.
     vx: float = 0.0
     vy: float = 0.0
     # Absolute sim time when this cell may re-merge with siblings (compare to
-    # ctx.now). Populated by the Rust engine.
+    # ctx.now).
     can_merge_at: float = 0.0
 
 
@@ -109,4 +108,3 @@ class BotInitContext:
 class BotBrain(Protocol):
     def decide(self, ctx: BotContext) -> BotAction:
         """Return desired input for this bot tick."""
-

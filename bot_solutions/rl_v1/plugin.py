@@ -20,13 +20,7 @@ from agario.bots.registry import BotRegistry
 from agario.bots.types import BotAction, BotContext, BotInitContext
 
 from . import CHECKPOINT_ROOT
-from .obs import (
-    N_DIRECTIONS,
-    AgentPerception,
-    action_to_target,
-    apply_turn,
-    encode,
-)
+from .obs import N_DIRECTIONS, action_to_target, apply_turn
 
 DEFAULT_CHECKPOINT = str(CHECKPOINT_ROOT / "rl/latest.pt")
 
@@ -76,34 +70,10 @@ class NeuralBrain:
 
         import torch
 
-        now = ctx.now
-        own = [
-            (b.x, b.y, b.mass, b.radius, b.vx, b.vy, max(0.0, b.can_merge_at - now))
-            for b in ctx.me.blobs
-        ]
-        enemy = [
-            (
-                b.x, b.y, b.mass, b.radius, b.vx, b.vy,
-                p.total_mass, len(p.blobs), max(0.0, b.can_merge_at - now),
-            )
-            for p in ctx.players
-            if p.id != ctx.me.id
-            for b in p.blobs
-        ]
-        perception = AgentPerception(
-            world_w=ctx.world_width,
-            world_h=ctx.world_height,
-            heading=self._heading,
-            prev_turn=self._prev[0],
-            prev_op=self._prev[1],
-            prev_speed=self._prev[2],
-            own_blobs=own,
-            enemy_blobs=enemy,
-            foods=[(f.x, f.y, f.mass) for f in ctx.foods],
-            ejected=[(e.x, e.y, e.mass) for e in ctx.ejected],
-            viruses=[(v.x, v.y, v.radius) for v in ctx.viruses],
-        )
-        obs = torch.as_tensor(encode(perception)).unsqueeze(0)
+        world = ctx.memory["_world"]
+        control = [(self._heading, self._prev[0], self._prev[1], self._prev[2])]
+        encoded = bytearray(world.observe([ctx.me.id], ctx.now, control))
+        obs = torch.frombuffer(encoded, dtype=torch.float32).unsqueeze(0)
 
         policy = _load_policy(self._checkpoint)
         if self._hidden is None:

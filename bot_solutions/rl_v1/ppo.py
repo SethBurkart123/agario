@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--death-penalty", type=float, default=2.0)
     parser.add_argument(
         "--spawn-mass-jitter", type=float, default=0.0,
-        help=">0 spawns agents at 560 x U(1/(1+j), 1+j): predator/prey "
+        help=">0 randomizes spawn mass to create predator/prey "
         "asymmetry that keeps splits/hunting profitable in self-play",
     )
     parser.add_argument(

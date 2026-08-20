@@ -4,9 +4,19 @@ from __future__ import annotations
 
 from math import exp, hypot
 
-from agario import config
+from agario_core import mechanics
 from agario.bots.registry import BotRegistry
 from agario.bots.types import BlobView, BotAction, BotContext, BotInitContext, PlayerView
+
+MECHANICS = mechanics()
+EAT_MASS_RATIO = MECHANICS["eat_mass_ratio"]
+EAT_OVERLAP = MECHANICS["eat_overlap_fraction"]
+VIRUS_MASS = MECHANICS["virus_mass"]
+MIN_SPLIT_MASS = MECHANICS["player_min_split_mass"]
+MIN_BLOB_MASS = MECHANICS["player_min_mass"]
+MAX_BLOBS = MECHANICS["max_player_blobs"]
+SPLIT_DISTANCE = MECHANICS["player_split_distance"]
+SPLIT_BOOST = MECHANICS["player_split_boost"]
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
@@ -59,7 +69,12 @@ def _smallest_blob(player: PlayerView):
 
 
 def _can_eat(attacker_mass: float, defender_mass: float) -> bool:
-    return attacker_mass > defender_mass * config.BLOB_EAT_RATIO
+    return attacker_mass > defender_mass * EAT_MASS_RATIO
+
+
+def _split_eat_reach(attacker: BlobView, target: BlobView) -> float:
+    child_radius = attacker.radius / 2**0.5
+    return SPLIT_DISTANCE + SPLIT_BOOST + child_radius - target.radius * EAT_OVERLAP
 
 
 def _iter_enemy_blobs(ctx: BotContext):
@@ -117,7 +132,7 @@ def _threat_field(ctx: BotContext) -> tuple[float, float, float, float]:
             vec_y += uy * local_pressure
             pressure += local_pressure
 
-            eat_reach = max(0.0, enemy.radius - me_blob.radius * config.BLOB_EAT_OVERLAP)
+            eat_reach = max(0.0, enemy.radius - me_blob.radius * EAT_OVERLAP)
             danger_window = max(20.0, enemy.radius * 0.82)
             gap = dist - eat_reach
             if gap < danger_window:
@@ -160,7 +175,7 @@ def _wall_field(ctx: BotContext, x: float, y: float, radius: float) -> tuple[flo
 
 
 def _virus_field(ctx: BotContext, me_blob: BlobView) -> tuple[float, float, float]:
-    if me_blob.mass <= config.VIRUS_MASS * 1.08:
+    if me_blob.mass <= VIRUS_MASS * EAT_MASS_RATIO:
         return (0.0, 0.0, 0.0)
 
     vx = 0.0
@@ -357,7 +372,7 @@ def _instant_imminence(ctx: BotContext, me_blob: BlobView) -> float:
         if not _can_eat(enemy.mass, me_blob.mass):
             continue
         dist = hypot(enemy.x - me_blob.x, enemy.y - me_blob.y)
-        eat_reach = max(0.0, enemy.radius - me_blob.radius * config.BLOB_EAT_OVERLAP)
+        eat_reach = max(0.0, enemy.radius - me_blob.radius * EAT_OVERLAP)
         danger_window = max(26.0, enemy.radius * 0.95)
         gap = dist - eat_reach
         if gap < danger_window:
@@ -410,7 +425,7 @@ def _best_prey(ctx: BotContext, me_blob: BlobView, x: float, y: float):
 
         dist = hypot(enemy.x - x, enemy.y - y)
         close_factor = max(0.0, 1.0 - dist / (me_blob.radius * 9.0 + 520.0))
-        mass_adv = (me_blob.mass / max(1.0, enemy.mass)) - config.BLOB_EAT_RATIO
+        mass_adv = (me_blob.mass / max(1.0, enemy.mass)) - EAT_MASS_RATIO
         risk = _target_risk(ctx, enemy.x, enemy.y, me_blob.mass)
         crowd_penalty = _crowding_penalty(ctx, ctx.me, enemy)
         score = close_factor * 1.25 + min(2.2, mass_adv * 0.55) + enemy.mass * 0.004 - risk * 1.08 - crowd_penalty * 0.3
@@ -450,12 +465,12 @@ def _attack_likelihood(
     chase_range = me_blob.radius * (4.35 + aggression * 1.1) + 360.0
 
     post_split_mass = me_blob.mass * 0.5
-    split_can_eat = post_split_mass > target_blob.mass * (config.BLOB_EAT_RATIO + 0.03)
-    split_reach = me_blob.radius * 2.75 + target_blob.radius * 1.45 + 90.0
+    split_can_eat = post_split_mass > target_blob.mass * (EAT_MASS_RATIO + 0.03)
+    split_reach = _split_eat_reach(me_blob, target_blob)
     split_window = split_ready and split_can_eat and dist < split_reach
 
     distance_factor = _clamp(1.0 - dist / max(1.0, chase_range), 0.0, 1.0)
-    size_factor = _clamp((mass_ratio - config.BLOB_EAT_RATIO) / 1.65, 0.0, 1.0)
+    size_factor = _clamp((mass_ratio - EAT_MASS_RATIO) / 1.65, 0.0, 1.0)
     edible_count, edible_mass = _edible_cluster_value(me_blob, target_player)
     cluster_count_factor = _clamp((edible_count - 1) / 4.0, 0.0, 1.0)
     cluster_mass_factor = _clamp(edible_mass / max(1.0, me_blob.mass * 0.95), 0.0, 1.0)
@@ -584,10 +599,10 @@ class SoloSmartBrain:
             if cached is not None:
                 return cached
 
-        max_split_blobs = min(config.MAX_PLAYER_BLOBS, 8)
+        max_split_blobs = min(MAX_BLOBS, 8)
         split_ready = (
             len(ctx.me.blobs) < max_split_blobs
-            and me_blob.mass >= config.PLAYER_MIN_SPLIT_MASS
+            and me_blob.mass >= MIN_SPLIT_MASS
             and ctx.now >= float(ctx.memory.get("next_split_at", 0.0))
         )
 
@@ -709,7 +724,7 @@ class SoloSmartBrain:
                 split_ready
                 and imminence > 0.84 / self.caution
                 and effective_threat > 1.06 / self.caution
-                and me_small.mass > config.MIN_BLOB_MASS * 1.25
+                and me_small.mass > MIN_BLOB_MASS * 1.25
                 and self.rng.random() < (0.22 + imminence * 0.28) * self.panic_split_chance
             )
             if split_escape:
@@ -735,7 +750,7 @@ class SoloSmartBrain:
             to_target_y = prey.y - me_y
             dist = max(1.0, hypot(to_target_x, to_target_y))
             ux, uy = _unit(to_target_x, to_target_y)
-            near_finish = dist < (me_blob.radius + prey.radius) * 1.12
+            near_finish = dist < me_blob.radius - prey.radius * EAT_OVERLAP
 
             if ctx.now >= float(ctx.memory.get("next_strafe_at", 0.0)):
                 self.strafe_dir *= -1.0 if self.rng.random() < 0.78 else 1.0
@@ -752,8 +767,8 @@ class SoloSmartBrain:
             target_y += wall_y * 120.0 + virus_y * 105.0 - threat_y * 38.0 + crowd_y * 84.0
 
             post_split_mass = me_blob.mass * 0.5
-            split_can_eat = post_split_mass > prey.mass * (config.BLOB_EAT_RATIO + 0.03)
-            split_reach = me_blob.radius * 2.75 + prey.radius * 1.45 + 90.0
+            split_can_eat = post_split_mass > prey.mass * (EAT_MASS_RATIO + 0.03)
+            split_reach = _split_eat_reach(me_blob, prey)
 
             split_kill = (
                 split_ready

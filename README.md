@@ -1,6 +1,6 @@
-# Agar Clone (Python Multiplayer)
+# Agar Clone
 
-A modular Agar.io-style multiplayer prototype with an authoritative Python backend and browser canvas frontend.
+A multiplayer Agar.io-style simulator with an authoritative Rust core, Python server orchestration, and a browser canvas client.
 
 ## Features
 
@@ -12,7 +12,7 @@ A modular Agar.io-style multiplayer prototype with an authoritative Python backe
 - Blob eating and leaderboard
 - Split (`Space`)
 - Eject mass (`W`)
-- Virus hazards that split large blobs ("blow-up" behavior)
+- Feedable viruses that grow, launch children, and pop player cells
 - Visibility culling + spatial hash broad-phase for better scalability
 
 ## Project Structure
@@ -20,12 +20,10 @@ A modular Agar.io-style multiplayer prototype with an authoritative Python backe
 ```text
 agario/
 ├── agario/
-│   ├── config.py      # Tunables and constants
+│   ├── config.py      # Server and bot-process settings
 │   ├── bots/          # Bot plugin contracts + runtime manager
-│   ├── models.py      # Dataclasses for entities
-│   ├── spatial.py     # Spatial hash helper
-│   ├── world.py       # Authoritative simulation
 │   └── server.py      # FastAPI + websocket orchestration
+├── agario_core/       # Authoritative Rust simulation and RL batch engine
 ├── bot_solutions/
 │   ├── programmatic/  # Hand-written bot strategies
 │   └── rl_v1/         # Neural bot, training stack, tools, and checkpoints
@@ -52,23 +50,14 @@ Open: `http://localhost:8000`
 - Split: `Space`
 - Eject Mass: `W`
 
-## Simulation Engines
+## Simulation
 
-Two interchangeable engines run the same physics:
+`agario_core/` is the only simulation implementation. It is used by the live
+server, programmatic bots, and RL training. Gameplay defaults and formulas live
+in `agario_core/src/config.rs` and `agario_core/src/world.rs`; Python reads the
+small public settings map exposed by the extension.
 
-- **Rust core** (`agario_core/`, default) — a parity-tested PyO3 port of the
-  Python world. ~1,100x realtime on the full map vs ~15x for Python. Used by
-  the live server and by RL training.
-- **Python reference** (`agario/world.py`) — the readable source of truth.
-
-Select with `AGARIO_ENGINE=rust|python`. Parity is enforced by
-`uv run python -m tools.parity_check`, which drives both engines with an
-identical seed + scripted inputs and compares full state tick-by-tick (the
-Rust core embeds a CPython-compatible MT19937 so seeded runs match bitwise).
-Benchmark either engine with `uv run python -m tools.bench_sim --engine rust`.
-
-If you change game mechanics, change `agario/world.py` AND the mirrored code
-in `agario_core/src/world.rs`, then run the parity check.
+Benchmark with `uv run python -m tools.bench_sim`.
 
 ## RL Training (neural bots)
 
@@ -96,9 +85,9 @@ trainer logs to Weights & Biases if installed.
 
 ## Notes for Extending
 
-- Add new game mechanics in `agario/world.py` so simulation remains server-authoritative.
+- Add game mechanics in `agario_core/` so every consumer uses the same rules.
 - Keep protocol changes coordinated between `agario/server.py` and `static/client.js`.
-- Gameplay constants live in `agario/config.py` for quick balancing.
+- Keep `agario/config.py` limited to server and bot-process settings.
 
 ## Bot Plugin System
 

@@ -1,6 +1,6 @@
 //! CPython-compatible Mersenne Twister so a Rust world seeded with N produces
 //! the exact same random stream as Python's `random.Random(N)`. This is what
-//! makes bitwise parity testing against the Python reference world possible.
+//! keeps seeded training arenas reproducible.
 
 const N: usize = 624;
 const M: usize = 397;
@@ -18,7 +18,10 @@ impl PyMt19937 {
     /// Mirrors `random.Random(seed)` for non-negative integer seeds: the seed
     /// is decomposed into little-endian 32-bit words and fed to init_by_array.
     pub fn new(seed: u64) -> Self {
-        let mut rng = PyMt19937 { mt: [0; N], index: N };
+        let mut rng = PyMt19937 {
+            mt: [0; N],
+            index: N,
+        };
         let mut key: Vec<u32> = vec![(seed & 0xffff_ffff) as u32];
         if seed >> 32 != 0 {
             key.push((seed >> 32) as u32);
@@ -112,7 +115,7 @@ impl PyMt19937 {
 
     /// random.Random.getrandbits(k) for 0 < k <= 32.
     pub fn getrandbits(&mut self, k: u32) -> u32 {
-        debug_assert!(k >= 1 && k <= 32);
+        debug_assert!((1..=32).contains(&k));
         self.genrand_u32() >> (32 - k)
     }
 

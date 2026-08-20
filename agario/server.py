@@ -11,18 +11,19 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from agario_core import CoreWorld, mechanics
 
 from . import config
 from .bots.manager import BotManager
-from .engine import create_world
+
+MECHANICS = mechanics()
 
 
 class RealtimeServer:
     def __init__(self) -> None:
-        self.world = create_world()
+        self.world = CoreWorld()
         self.bot_manager = BotManager.from_config(self.world)
         self.connections: dict[str, WebSocket] = {}
-        self.connection_overview_mode: dict[str, bool] = {}
         self.spectators: dict[str, WebSocket] = {}
         self._spectator_ids = count(1)
         self.lock = asyncio.Lock()
@@ -51,30 +52,28 @@ class RealtimeServer:
                     "type": "welcome",
                     "spectator": True,
                     "spectatorId": spectator_id,
-                    "tickRate": config.TICK_RATE,
+                    "tickRate": MECHANICS["tick_rate"],
                     "inputHz": config.INPUT_HZ,
-                    "world": {"w": config.WORLD_WIDTH, "h": config.WORLD_HEIGHT},
+                    "world": {"w": MECHANICS["world_width"], "h": MECHANICS["world_height"]},
                 }
 
             player = self.world.add_player(player_name=player_name, now=now)
             self.connections[player.id] = websocket
-            self.connection_overview_mode[player.id] = False
 
         return {
             "type": "welcome",
             "playerId": player.id,
             "name": player.name,
             "spectator": False,
-            "tickRate": config.TICK_RATE,
+            "tickRate": MECHANICS["tick_rate"],
             "inputHz": config.INPUT_HZ,
-            "world": {"w": config.WORLD_WIDTH, "h": config.WORLD_HEIGHT},
+            "world": {"w": MECHANICS["world_width"], "h": MECHANICS["world_height"]},
         }
 
     async def disconnect(self, player_id: str | None = None, spectator_id: str | None = None) -> None:
         async with self.lock:
             if player_id is not None:
                 self.connections.pop(player_id, None)
-                self.connection_overview_mode.pop(player_id, None)
                 self.world.remove_player(player_id)
             if spectator_id is not None:
                 self.spectators.pop(spectator_id, None)
@@ -89,13 +88,8 @@ class RealtimeServer:
         async with self.lock:
             self.world.set_input(player_id, tx, ty, split=split, eject=eject)
 
-    async def set_view_mode(self, player_id: str, *, overview: bool) -> None:
-        async with self.lock:
-            if player_id in self.connections:
-                self.connection_overview_mode[player_id] = overview
-
     async def _tick_loop(self) -> None:
-        interval = 1.0 / config.TICK_RATE
+        interval = 1.0 / MECHANICS["tick_rate"]
         last = time.perf_counter()
 
         while True:
@@ -109,12 +103,7 @@ class RealtimeServer:
                 snapshots: list[tuple[str | None, str | None, WebSocket, dict]] = []
                 overview_snapshot: dict | None = None
                 for player_id, websocket in self.connections.items():
-                    if self.connection_overview_mode.get(player_id, False):
-                        if overview_snapshot is None:
-                            overview_snapshot = self.world.snapshot_overview()
-                        snapshot = overview_snapshot
-                    else:
-                        snapshot = self.world.snapshot_for(player_id)
+                    snapshot = self.world.snapshot_for(player_id)
                     if snapshot is None:
                         continue
                     snapshots.append((player_id, None, websocket, snapshot))
@@ -199,9 +188,6 @@ async def websocket_handler(websocket: WebSocket) -> None:
             msg = await websocket.receive_json()
             if msg.get("type") == "ping":
                 await websocket.send_json({"type": "pong", "ts": msg.get("ts")})
-                continue
-            if msg.get("type") == "view_mode" and player_id is not None:
-                await state.set_view_mode(player_id, overview=bool(msg.get("overview", False)))
                 continue
             if msg.get("type") != "input" or player_id is None:
                 continue

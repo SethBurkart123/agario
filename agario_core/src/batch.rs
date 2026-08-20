@@ -13,26 +13,17 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use rayon::prelude::*;
 
-use crate::config::WorldConfig;
+use crate::config::{WorldConfig, TICK_RATE};
 use crate::world::{CoreWorld, OBS_DIM};
 
-const DT: f64 = 1.0 / 75.0;
+const DT: f64 = 1.0 / TICK_RATE;
 const TURN_OFFSETS: [i64; 8] = [0, 1, -1, 2, -2, 4, -4, 8];
 const N_DIRECTIONS: i64 = 16;
 const TWO_PI: f64 = std::f64::consts::PI * 2.0;
-// Input response curve (mirrors bot_solutions/rl_v1/obs.py).
-const INPUT_DEADZONE: f64 = 8.0;
-const INPUT_RAMP: f64 = 82.0;
-const INPUT_EASE: f64 = 0.7;
-const MAX_SPEED_CMD: f64 = 0.995;
-const START_MASS: f64 = 560.0;
+const ACTION_TARGET_DISTANCE: f64 = 600.0;
 
 fn distance_from_speed(speed: f64) -> f64 {
-    let s = speed.clamp(0.0, MAX_SPEED_CMD);
-    if s <= 0.0 {
-        return 0.0;
-    }
-    INPUT_DEADZONE + INPUT_RAMP * (-(1.0 - s).ln()).powf(1.0 / INPUT_EASE)
+    speed.clamp(0.0, 1.0) * ACTION_TARGET_DISTANCE
 }
 
 /// splitmix64 — cheap deterministic per-arena RNG for scenario sampling.
@@ -66,7 +57,6 @@ struct Arena {
     learners: Vec<u64>,
     anchors: Vec<u64>,
     ctl: Vec<AgentCtl>,
-    rng: u64,
 }
 
 struct EpisodeStat {
@@ -82,12 +72,12 @@ struct Rollout {
     world: CoreWorld,
     now: f64,
     size: f64,
-    root: usize,      // index into the search roots
-    cand: usize,      // which candidate first-move
-    sample: usize,    // which averaging sample this clone is
+    root: usize,   // index into the search roots
+    cand: usize,   // which candidate first-move
+    sample: usize, // which averaging sample this clone is
     focal: u64,
-    drivers: Vec<u64>,             // learner ids driven by external actions
-    ctl: Vec<(i64, usize, usize, f64)>,  // (heading, prev_turn, prev_op, prev_speed)
+    drivers: Vec<u64>,                  // learner ids driven by external actions
+    ctl: Vec<(i64, usize, usize, f64)>, // (heading, prev_turn, prev_op, prev_speed)
     anchors: Vec<u64>,
     score: f64,
     discount: f64,
@@ -137,7 +127,9 @@ impl BatchedArenas {
         cfg.world_width = size;
         cfg.world_height = size;
         cfg.food_target_count = ((220.0 * area_scale) as usize).max(40);
-        cfg.virus_count = ((6.0 * area_scale) as usize).max(2);
+        cfg.virus_min_count = ((6.0 * area_scale) as usize).max(2);
+        cfg.virus_max_count = (cfg.virus_min_count * 3).max(cfg.virus_min_count);
+        let start_mass = cfg.player_start_mass;
 
         let mut world = CoreWorld::new_internal(seed, cfg);
         let learners: Vec<u64> = (0..self.n_learners)
@@ -151,7 +143,7 @@ impl BatchedArenas {
             let lo = 1.0 / (1.0 + self.spawn_jitter);
             let hi = 1.0 + self.spawn_jitter;
             for id in learners.iter().chain(anchors.iter()) {
-                let m = START_MASS * uniform(&mut rng, lo, hi);
+                let m = start_mass * uniform(&mut rng, lo, hi);
                 world.scale_mass_internal(*id, m);
             }
         }
@@ -180,15 +172,16 @@ impl BatchedArenas {
             learners,
             anchors,
             ctl,
-            rng,
         }
     }
 }
 
 fn drive(world: &mut CoreWorld, id: u64, heading: i64, speed: f64, op: usize, size: f64) {
-    let Some((cx, cy)) = world.center_of(id) else { return };
+    let Some((cx, cy)) = world.center_of(id) else {
+        return;
+    };
     let angle = (heading as f64 / N_DIRECTIONS as f64) * TWO_PI;
-    let dist = if speed >= MAX_SPEED_CMD { 600.0 } else { distance_from_speed(speed) };
+    let dist = distance_from_speed(speed);
     let tx = (cx + angle.cos() * dist).clamp(0.0, size);
     let ty = (cy + angle.sin() * dist).clamp(0.0, size);
     world.set_input_raw(id, tx, ty, op == 1, op == 2);
@@ -196,7 +189,9 @@ fn drive(world: &mut CoreWorld, id: u64, heading: i64, speed: f64, op: usize, si
 
 /// Built-in anchor brain: flee anything that can eat you, otherwise eat.
 fn drive_anchor_world(world: &mut CoreWorld, id: u64, size: f64) {
-    let Some((cx, cy)) = world.center_of(id) else { return };
+    let Some((cx, cy)) = world.center_of(id) else {
+        return;
+    };
     let my_big = world.biggest_blob_mass_of(id);
     let (tx, ty) = match world.nearest_threat(id, cx, cy, my_big, 1.2, 600.0) {
         Some((bx, by)) => {
@@ -205,7 +200,9 @@ fn drive_anchor_world(world: &mut CoreWorld, id: u64, size: f64) {
             let mag = (dx * dx + dy * dy).sqrt().max(1e-6);
             (cx + dx / mag * 600.0, cy + dy / mag * 600.0)
         }
-        None => world.nearest_food_to(cx, cy).unwrap_or((size * 0.5, size * 0.5)),
+        None => world
+            .nearest_food_to(cx, cy)
+            .unwrap_or((size * 0.5, size * 0.5)),
     };
     world.set_input_raw(id, tx.clamp(0.0, size), ty.clamp(0.0, size), false, false);
 }
@@ -318,7 +315,7 @@ struct Params {
 impl BatchedArenas {
     #[new]
     #[pyo3(signature = (n_arenas, n_learners, n_anchors=2, seed=0,
-        size_lo=2000.0, size_hi=4200.0, frame_skip=6, episode_decisions=1100,
+        size_lo=2000.0, size_hi=4200.0, frame_skip=2, episode_decisions=1100,
         anchor_every=4, kill_bonus=1.0, death_penalty=2.0, mass_scale=0.1,
         spawn_jitter=1.2))]
     #[allow(clippy::too_many_arguments)]
@@ -394,16 +391,16 @@ impl BatchedArenas {
                     }
                 });
         });
-        let bytes = unsafe {
-            std::slice::from_raw_parts(obs.as_ptr() as *const u8, obs.len() * 4)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(obs.as_ptr() as *const u8, obs.len() * 4) };
         PyBytes::new(py, bytes).unbind()
     }
 
     /// actions: flat f32 [n_arenas * n_learners * 3] of (turn, op, speed).
     /// Returns (obs_bytes, rewards_bytes f32, truncations_bytes u8).
     fn step(
-        &mut self, py: Python<'_>, actions: Vec<f32>,
+        &mut self,
+        py: Python<'_>,
+        actions: Vec<f32>,
     ) -> (Py<PyBytes>, Py<PyBytes>, Py<PyBytes>) {
         let n_l = self.n_learners;
         let n_total = self.arenas.len() * n_l;
@@ -465,12 +462,9 @@ impl BatchedArenas {
             }
         }
 
-        let ob = unsafe {
-            std::slice::from_raw_parts(obs.as_ptr() as *const u8, obs.len() * 4)
-        };
-        let rb = unsafe {
-            std::slice::from_raw_parts(rewards.as_ptr() as *const u8, rewards.len() * 4)
-        };
+        let ob = unsafe { std::slice::from_raw_parts(obs.as_ptr() as *const u8, obs.len() * 4) };
+        let rb =
+            unsafe { std::slice::from_raw_parts(rewards.as_ptr() as *const u8, rewards.len() * 4) };
         (
             PyBytes::new(py, ob).unbind(),
             PyBytes::new(py, rb).unbind(),
@@ -604,9 +598,7 @@ impl BatchedArenas {
                     }
                 });
         });
-        let bytes = unsafe {
-            std::slice::from_raw_parts(obs.as_ptr() as *const u8, obs.len() * 4)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(obs.as_ptr() as *const u8, obs.len() * 4) };
         PyBytes::new(py, bytes).unbind()
     }
 
@@ -693,9 +685,7 @@ impl BatchedArenas {
                     );
                 });
         });
-        let bytes = unsafe {
-            std::slice::from_raw_parts(obs.as_ptr() as *const u8, obs.len() * 4)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(obs.as_ptr() as *const u8, obs.len() * 4) };
         PyBytes::new(py, bytes).unbind()
     }
 

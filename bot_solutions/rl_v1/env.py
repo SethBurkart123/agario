@@ -20,24 +20,23 @@ stacked as (n_arenas * n_learners, ...).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
 
-from agario_core import CoreWorld
+from agario_core import CoreWorld, mechanics
 
 from .heuristic import HeuristicDriver
 from .obs import (
     N_DIRECTIONS,
     OBS_DIM,
-    AgentPerception,
     action_to_target,
     apply_turn,
-    encode,
 )
 
-TICK_RATE = 75.0
+MECHANICS = mechanics()
+TICK_RATE = MECHANICS["tick_rate"]
 DT = 1.0 / TICK_RATE
 
 
@@ -46,14 +45,14 @@ class ArenaConfig:
     world_size: float = 2500.0
     # Per-episode domain randomization: arena side length sampled from this
     # range (food/virus counts scale with area). Covers everything from
-    # crowded knife-fights to sparse open space like the live 6000x6000 map.
+    # crowded knife-fights to sparse open space.
     size_range: tuple[float, float] | None = (2000.0, 4200.0)
     food_count: int = 220
     virus_count: int = 6
     n_learners: int = 5
     n_frozen: int = 2
     n_heuristic: int = 1
-    frame_skip: int = 6  # decisions at 12.5 Hz
+    frame_skip: int = 2  # decisions at 12.5 Hz
     # Heuristic anchors think every Nth decision (~160 ms at 2) — within their
     # natural reaction times, and the sim keeps steering toward the last
     # target between thinks. Their Python brains are the env's biggest cost.
@@ -62,23 +61,21 @@ class ArenaConfig:
     death_penalty: float = 2.0
     kill_bonus: float = 1.0
     mass_reward_scale: float = 0.1
-    # Spawn-mass asymmetry: each agent starts at 560 x U(lo, hi). Symmetric
+    # Optional spawn-mass asymmetry creates predator/prey situations.
     # spawns in self-play make splits/hunting structurally worthless (nobody
     # ever has the advantage a split-kill needs), so PPO bleeds those
     # behaviors out. Predator/prey asymmetry keeps them profitable.
     spawn_mass_range: tuple[float, float] | None = None
-    overrides: dict = field(default_factory=dict)
-
     def world_overrides(self, size: float) -> dict:
         area_scale = (size * size) / (self.world_size * self.world_size)
-        base = {
-            "WORLD_WIDTH": size,
-            "WORLD_HEIGHT": size,
-            "FOOD_TARGET_COUNT": max(40, int(self.food_count * area_scale)),
-            "VIRUS_COUNT": max(2, int(self.virus_count * area_scale)),
+        virus_count = max(2, int(self.virus_count * area_scale))
+        return {
+            "world_width": size,
+            "world_height": size,
+            "food_target_count": max(40, int(self.food_count * area_scale)),
+            "virus_min_count": virus_count,
+            "virus_max_count": virus_count * 3,
         }
-        base.update(self.overrides)
-        return base
 
 
 class ArenaEnv:
@@ -137,7 +134,9 @@ class ArenaEnv:
             lo, hi = self.cfg.spawn_mass_range
             mass_rng = np.random.default_rng((seed + 7) % (2**32))
             for pid in self.learner_ids + self.frozen_ids + self.heuristic_ids:
-                self.world.set_player_mass(pid, float(560.0 * mass_rng.uniform(lo, hi)))
+                self.world.set_player_mass(
+                    pid, float(MECHANICS["player_start_mass"] * mass_rng.uniform(lo, hi))
+                )
         heading_rng = np.random.default_rng((seed + 13) % (2**32))
         self._headings = {
             pid: int(heading_rng.integers(N_DIRECTIONS))
@@ -256,60 +255,8 @@ class ArenaEnv:
         return out
 
     def _encode_for(self, ids: list[str], out: np.ndarray) -> None:
-        if hasattr(self.world, "observe"):
-            buf = self.world.observe(ids, self.now, self._control_for(ids))
-            out[:] = np.frombuffer(buf, dtype=np.float32).reshape(len(ids), OBS_DIM)
-            return
-        self._encode_for_py(ids, out)
-
-    def _encode_for_py(self, ids: list[str], out: np.ndarray) -> None:
-        """Pure-Python reference encoder; tools/obs_equivalence.py asserts it
-        matches the Rust fast path bit-for-bit (within f32 tolerance)."""
-        compact = self.world.players_compact()
-        food_rows, ejected_rows, virus_rows = self.world.entities_compact()
-        foods = [(x, y, m) for _id, x, y, m, _r, _c in food_rows]
-        ejected = [(x, y, m) for _id, x, y, m, _r, _o, _t in ejected_rows]
-        viruses = [(x, y, r) for _id, x, y, _m, r in virus_rows]
-
-        # Per player: own-view rows (x, y, mass, radius, vx, vy, merge_in)
-        # plus owner aggregates for the enemy-view rows.
-        now = self.now
-        blob_map: dict[str, list[tuple[float, float, float, float, float, float, float]]] = {}
-        owner_stats: dict[str, tuple[float, int]] = {}
-        for pid, _n, _c, _b, _pl, _t, _tx, _ty, blob_rows in compact:
-            rows = [
-                (x, y, m, r, vx, vy, max(0.0, cma - now))
-                for _bid, x, y, m, r, vx, vy, cma in blob_rows
-            ]
-            blob_map[pid] = rows
-            owner_stats[pid] = (sum(r[2] for r in rows), len(rows))
-
-        for idx, pid in enumerate(ids):
-            own = blob_map.get(pid, [])
-            enemy: list[
-                tuple[float, float, float, float, float, float, float, int, float]
-            ] = []
-            for other_pid, blobs in blob_map.items():
-                if other_pid == pid:
-                    continue
-                o_mass, o_cells = owner_stats[other_pid]
-                for x, y, m, r, vx, vy, merge_in in blobs:
-                    enemy.append((x, y, m, r, vx, vy, o_mass, o_cells, merge_in))
-            prev_turn, prev_op, prev_speed = self._prev_action.get(pid, (0, 0, 1.0))
-            perception = AgentPerception(
-                world_w=self.size,
-                world_h=self.size,
-                heading=self._headings.get(pid, 0),
-                prev_turn=prev_turn,
-                prev_op=prev_op,
-                prev_speed=prev_speed,
-                own_blobs=own,
-                enemy_blobs=enemy,
-                foods=foods,
-                ejected=ejected,
-                viruses=viruses,
-            )
-            encode(perception, out=out[idx])
+        buf = self.world.observe(ids, self.now, self._control_for(ids))
+        out[:] = np.frombuffer(buf, dtype=np.float32).reshape(len(ids), OBS_DIM)
 
 
 class VecArena:

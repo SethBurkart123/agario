@@ -28,6 +28,7 @@ from itertools import count
 from pathlib import Path
 
 import numpy as np
+from agario_core import mechanics
 import torch
 
 from .bc import CHECKPOINT_DIR, ExpertArena
@@ -81,7 +82,9 @@ def run_collector(args) -> None:
             if roll < 0.25:
                 env.world.scatter_player(pid, int(rng.integers(3, 11)), env.now)
             elif roll < 0.45:
-                env.world.set_player_mass(pid, float(560.0 * rng.uniform(0.3, 4.0)))
+                env.world.set_player_mass(
+                    pid, float(mechanics()["player_start_mass"] * rng.uniform(0.3, 4.0))
+                )
 
     student: PolicyNet | None = None
     student_mtime = 0.0

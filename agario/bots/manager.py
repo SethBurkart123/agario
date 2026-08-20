@@ -6,7 +6,8 @@ import logging
 import random
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+
+from agario_core import CoreWorld, mechanics
 
 from .. import config
 from .registry import BotRegistry, load_plugin_modules
@@ -22,10 +23,8 @@ from .types import (
     VirusView,
 )
 
-if TYPE_CHECKING:
-    from ..world import GameWorld
-
 logger = logging.getLogger(__name__)
+MECHANICS = mechanics()
 
 
 def parse_bot_specs(raw: str) -> list[BotSpec]:
@@ -75,7 +74,7 @@ class _BotAgent:
 class BotManager:
     def __init__(
         self,
-        world: GameWorld,
+        world: CoreWorld,
         *,
         enabled: bool,
         plugin_modules: tuple[str, ...],
@@ -94,7 +93,7 @@ class BotManager:
         self._spawn_index = 0
 
     @classmethod
-    def from_config(cls, world: GameWorld) -> BotManager:
+    def from_config(cls, world: CoreWorld) -> BotManager:
         specs = parse_bot_specs(config.BOT_SPECS)
         return cls(
             world,
@@ -181,8 +180,8 @@ class BotManager:
             ctx = BotContext(
                 now=now,
                 dt=dt,
-                world_width=config.WORLD_WIDTH,
-                world_height=config.WORLD_HEIGHT,
+                world_width=MECHANICS["world_width"],
+                world_height=MECHANICS["world_height"],
                 me=me,
                 players=players,
                 foods=foods,
@@ -200,8 +199,8 @@ class BotManager:
 
             self.world.set_input(
                 player_id=player_id,
-                target_x=self._clamp(action.target_x, 0.0, config.WORLD_WIDTH),
-                target_y=self._clamp(action.target_y, 0.0, config.WORLD_HEIGHT),
+                target_x=self._clamp(action.target_x, 0.0, MECHANICS["world_width"]),
+                target_y=self._clamp(action.target_y, 0.0, MECHANICS["world_height"]),
                 split=bool(action.split),
                 eject=bool(action.eject),
             )
@@ -215,66 +214,7 @@ class BotManager:
         tuple[EjectedView, ...],
         tuple[VirusView, ...],
     ]:
-        if hasattr(self.world, "players_compact"):
-            return self._build_views_compact()
-        players: list[PlayerView] = []
-        for player in self.world.players.values():
-            blobs = tuple(
-                BlobView(
-                    id=blob.id,
-                    player_id=blob.player_id,
-                    x=blob.x,
-                    y=blob.y,
-                    mass=blob.mass,
-                    radius=blob.radius,
-                )
-                for blob in player.blobs.values()
-            )
-            players.append(
-                PlayerView(
-                    id=player.id,
-                    name=player.name,
-                    color=player.color,
-                    is_bot=player.is_bot,
-                    plugin_name=player.bot_plugin,
-                    team_id=player.bot_team,
-                    total_mass=sum(b.mass for b in blobs),
-                    blobs=blobs,
-                )
-            )
-
-        players.sort(key=lambda p: p.id)
-        players_by_id = {p.id: p for p in players}
-
-        foods = tuple(
-            FoodView(
-                id=food.id,
-                x=food.x,
-                y=food.y,
-                mass=food.mass,
-                radius=food.radius,
-                color=food.color,
-            )
-            for food in self.world.foods.values()
-        )
-        ejected = tuple(
-            EjectedView(
-                id=item.id,
-                x=item.x,
-                y=item.y,
-                mass=item.mass,
-                radius=item.radius,
-                owner_id=item.owner_id,
-                ttl=item.ttl,
-            )
-            for item in self.world.ejected.values()
-        )
-        viruses = tuple(
-            VirusView(id=v.id, x=v.x, y=v.y, mass=v.mass, radius=v.radius)
-            for v in self.world.viruses.values()
-        )
-
-        return (players_by_id, tuple(players), foods, ejected, viruses)
+        return self._build_views_compact()
 
     def _build_views_compact(
         self,
@@ -332,7 +272,10 @@ class BotManager:
         if me.blobs:
             first = me.blobs[0]
             return BotAction(target_x=first.x, target_y=first.y)
-        return BotAction(target_x=config.WORLD_WIDTH / 2.0, target_y=config.WORLD_HEIGHT / 2.0)
+        return BotAction(
+            target_x=MECHANICS["world_width"] / 2.0,
+            target_y=MECHANICS["world_height"] / 2.0,
+        )
 
     def _build_name(self, spec: BotSpec, index: int) -> str:
         prefix = spec.name_prefix or spec.plugin_name.replace("_", " ").title()

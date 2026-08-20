@@ -3,23 +3,22 @@ const ctx = canvas.getContext("2d");
 const statusEl = document.getElementById("status");
 const scoreEl = document.getElementById("score");
 const leaderboardEl = document.getElementById("leaderboard");
-const overviewToggleEl = document.getElementById("overview-toggle");
 
 const BG_COLOR = "#F2FBFF";
 const GRID_COLOR = "#CDD4D7";
 const VIRUS_FILL = "#34FF32";
 const VIRUS_BORDER = "#2EE52C";
-const PLAYER_BORDER_WORLD = 5.6;
-const VIRUS_BORDER_WORLD = 8.0;
+const PLAYER_BORDER_WORLD = 10;
+const VIRUS_BORDER_WORLD = 10;
 const EJECTED_BORDER_WORLD = 2.2;
 const VIRUS_SPIKE_SPACING_WORLD = 6.0;
+const SNAPSHOT_BLEND_MS = 120;
 
 let ws;
-let world = { w: 6000, h: 6000 };
+let world = { w: 14142.135623730952, h: 14142.135623730952 };
 let state = null;
 let playerId = null;
 let spectatorMode = false;
-let overviewMode = false;
 
 let splitQueued = false;
 let ejectQueued = false;
@@ -28,8 +27,9 @@ let serverInputHz = 60;
 let nextInputAt = 0;
 
 const mouse = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
-const camera = { x: world.w / 2, y: world.h / 2, zoom: 0.6 };
-const cameraTarget = { x: world.w / 2, y: world.h / 2, zoom: 0.6 };
+const camera = { x: world.w / 2, y: world.h / 2, zoom: 1 };
+const cameraTarget = { x: world.w / 2, y: world.h / 2, zoom: 1 };
+let cameraReady = false;
 
 let lastFrameAt = performance.now();
 
@@ -46,7 +46,6 @@ localStorage.setItem(nameKey, playerName);
 const pathIsOverview = window.location.pathname === "/overview";
 const queryOverview = new URLSearchParams(window.location.search).get("overview") === "1";
 const startInOverview = pathIsOverview || queryOverview;
-overviewMode = startInOverview;
 spectatorMode = startInOverview;
 
 function hashString(value) {
@@ -96,7 +95,7 @@ window.addEventListener("mousemove", (evt) => {
 });
 
 window.addEventListener("keydown", (evt) => {
-  if (spectatorMode || overviewMode) return;
+  if (spectatorMode) return;
   if (evt.code === "Space") {
     if (!evt.repeat) splitQueued = true;
     evt.preventDefault();
@@ -106,36 +105,6 @@ window.addEventListener("keydown", (evt) => {
     evt.preventDefault();
   }
 });
-
-function updateOverviewButton() {
-  if (!overviewToggleEl) return;
-  if (spectatorMode) {
-    overviewToggleEl.textContent = "Spectator: Full Map";
-    overviewToggleEl.disabled = true;
-    return;
-  }
-  overviewToggleEl.disabled = false;
-  overviewToggleEl.textContent = overviewMode ? "Overview: On" : "Overview: Off";
-}
-
-function sendViewMode() {
-  if (!ws || ws.readyState !== WebSocket.OPEN || spectatorMode || !playerId) return;
-  ws.send(
-    JSON.stringify({
-      type: "view_mode",
-      overview: overviewMode,
-    }),
-  );
-}
-
-if (overviewToggleEl) {
-  overviewToggleEl.addEventListener("click", () => {
-    if (spectatorMode) return;
-    overviewMode = !overviewMode;
-    updateOverviewButton();
-    sendViewMode();
-  });
-}
 
 function connect() {
   const protocol = location.protocol === "https:" ? "wss" : "ws";
@@ -160,12 +129,11 @@ function connect() {
       playerId = data.playerId || null;
       world = data.world;
       serverInputHz = Math.max(20, Number(data.inputHz || 60));
-      updateOverviewButton();
       if (spectatorMode) {
         statusEl.textContent = "Connected as spectator";
         scoreEl.textContent = "Spectator";
       } else {
-        sendViewMode();
+        statusEl.textContent = "";
       }
       return;
     }
@@ -178,8 +146,8 @@ function connect() {
       if (!spectatorMode) {
         scoreEl.textContent = `Score: ${state.player.score}`;
       }
-      drawLeaderboard(state.leaderboard, spectatorMode ? "" : state.player.name);
-      syncBlobVisuals(state.blobs);
+      drawLeaderboard(state.leaderboard);
+      syncBlobVisuals(state.blobs, performance.now());
       syncConsumedEffects(state);
       return;
     }
@@ -189,7 +157,7 @@ function connect() {
     statusEl.textContent = "Disconnected. Reconnecting...";
     playerId = null;
     spectatorMode = false;
-    overviewMode = startInOverview;
+    cameraReady = false;
     state = null;
     blobVisuals.clear();
     consumeFx.clear();
@@ -205,17 +173,18 @@ function connect() {
   });
 }
 
-function drawLeaderboard(rows, yourName) {
+function drawLeaderboard(rows) {
   leaderboardEl.innerHTML = "";
   for (const row of rows) {
     const li = document.createElement("li");
     li.textContent = row.name;
-    if (row.name === yourName) li.classList.add("you");
+    li.value = row.rank;
+    if (row.you) li.classList.add("you");
     leaderboardEl.append(li);
   }
 }
 
-function syncBlobVisuals(blobs) {
+function syncBlobVisuals(blobs, receivedAt) {
   const seen = new Set();
 
   for (const blob of blobs) {
@@ -229,10 +198,14 @@ function syncBlobVisuals(blobs) {
         color: blob.color,
         x: blob.x,
         y: blob.y,
+        sx: blob.x,
+        sy: blob.y,
         tx: blob.x,
         ty: blob.y,
         mass: blob.mass,
+        smass: blob.mass,
         tmass: blob.mass,
+        sampleAt: receivedAt - SNAPSHOT_BLEND_MS,
         vx: 0,
         vy: 0,
         seed: hashString(blob.id),
@@ -243,9 +216,13 @@ function syncBlobVisuals(blobs) {
     existing.playerId = blob.playerId;
     existing.name = blob.name;
     existing.color = blob.color;
+    existing.sx = existing.x;
+    existing.sy = existing.y;
+    existing.smass = existing.mass;
     existing.tx = blob.x;
     existing.ty = blob.y;
     existing.tmass = blob.mass;
+    existing.sampleAt = receivedAt;
   }
 
   for (const id of blobVisuals.keys()) {
@@ -254,7 +231,7 @@ function syncBlobVisuals(blobs) {
 }
 
 function sendInput() {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !playerId || spectatorMode || overviewMode) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !playerId || spectatorMode) {
     return;
   }
 
@@ -285,24 +262,48 @@ function maybeSendInput(nowMs) {
   }
 }
 
-function updateCamera(dt) {
-  const posSmooth = 1 - Math.exp(-10 * dt);
-  const zoomSmooth = 1 - Math.exp(-8 * dt);
-  camera.x += (cameraTarget.x - camera.x) * posSmooth;
-  camera.y += (cameraTarget.y - camera.y) * posSmooth;
-  camera.zoom += (cameraTarget.zoom - camera.zoom) * zoomSmooth;
+function viewRange() {
+  return Math.max(window.innerHeight / 1080, window.innerWidth / 1920);
 }
 
-function updateBlobVisuals(dt) {
-  const smooth = 1 - Math.exp(-24 * dt);
+function updateCamera(dt) {
+  const owned = spectatorMode
+    ? []
+    : [...blobVisuals.values()].filter((blob) => blob.playerId === playerId);
+
+  if (owned.length > 0) {
+    cameraTarget.x = owned.reduce((sum, blob) => sum + blob.x, 0) / owned.length;
+    cameraTarget.y = owned.reduce((sum, blob) => sum + blob.y, 0) / owned.length;
+    const totalSize = owned.reduce((sum, blob) => sum + worldRadius(blob), 0);
+    cameraTarget.zoom = Math.pow(Math.min(64 / Math.max(1, totalSize), 1), 0.4);
+  }
+
+  const targetZoom = cameraTarget.zoom * viewRange();
+  if (!cameraReady) {
+    camera.x = cameraTarget.x;
+    camera.y = cameraTarget.y;
+    camera.zoom = targetZoom;
+    cameraReady = true;
+    return;
+  }
+
+  const posSmooth = 1 - Math.pow(0.5, dt * 60);
+  const zoomSmooth = 1 - Math.pow(0.9, dt * 60);
+  camera.x += (cameraTarget.x - camera.x) * posSmooth;
+  camera.y += (cameraTarget.y - camera.y) * posSmooth;
+  camera.zoom += (targetZoom - camera.zoom) * zoomSmooth;
+}
+
+function updateBlobVisuals(nowMs, dt) {
 
   for (const blob of blobVisuals.values()) {
     const prevX = blob.x;
     const prevY = blob.y;
 
-    blob.x += (blob.tx - blob.x) * smooth;
-    blob.y += (blob.ty - blob.y) * smooth;
-    blob.mass += (blob.tmass - blob.mass) * (1 - Math.exp(-13 * dt));
+    const blend = clamp((nowMs - blob.sampleAt) / SNAPSHOT_BLEND_MS, 0, 1);
+    blob.x = blob.sx + (blob.tx - blob.sx) * blend;
+    blob.y = blob.sy + (blob.ty - blob.sy) * blend;
+    blob.mass = blob.smass + (blob.tmass - blob.smass) * blend;
 
     const safeDt = Math.max(dt, 1 / 240);
     blob.vx = (blob.x - prevX) / safeDt;
@@ -318,17 +319,14 @@ function toScreen(x, y) {
 }
 
 function drawGrid() {
-  const gridWorldSize = 30;
-  const projected = gridWorldSize * camera.zoom;
-  const stepMul = Math.max(1, Math.floor(14 / Math.max(1, projected)));
-  const cell = projected * stepMul;
+  const cell = 50 * camera.zoom;
 
   const xMinor = ((-camera.x * camera.zoom + window.innerWidth / 2) % cell + cell) % cell;
   const yMinor = ((-camera.y * camera.zoom + window.innerHeight / 2) % cell + cell) % cell;
 
-  ctx.strokeStyle = GRID_COLOR;
-  ctx.globalAlpha = 0.9;
-  ctx.lineWidth = 1.02;
+  ctx.strokeStyle = "#000000";
+  ctx.globalAlpha = 0.2;
+  ctx.lineWidth = 1;
   for (let x = xMinor; x <= window.innerWidth; x += cell) {
     ctx.beginPath();
     ctx.moveTo(x, 0);
@@ -370,6 +368,23 @@ function consumeSuppressed(key, nowMs) {
   return true;
 }
 
+function traceWobblingDisk(x, y, radius, key, timeSec, roughness = 0.045, points = 14) {
+  const phase = hashString(String(key)) * Math.PI * 2;
+  ctx.beginPath();
+  for (let i = 0; i <= points; i += 1) {
+    const angle = (i / points) * Math.PI * 2;
+    const wave =
+      Math.sin(timeSec * 3.1 + phase + i * 1.73) * 0.62 +
+      Math.sin(timeSec * 4.7 - phase * 0.7 - i * 1.11) * 0.38;
+    const localRadius = radius * (1 + wave * roughness);
+    const px = x + Math.cos(angle) * localRadius;
+    const py = y + Math.sin(angle) * localRadius;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
 function drawFood(nowMs) {
   if (!state) return;
   const blobs = [...blobVisuals.values()];
@@ -393,10 +408,9 @@ function drawFood(nowMs) {
     }
 
     const p = toScreen(food.x, food.y);
-    const radius = Math.max(4.8, Math.sqrt(food.mass) * 6.8 * camera.zoom);
+    const radius = Math.max(3, Math.sqrt(food.mass * 100) * camera.zoom);
 
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    traceWobblingDisk(p.x, p.y, radius, food.id, nowMs / 1000);
     ctx.fillStyle = food.color;
     ctx.fill();
   }
@@ -425,10 +439,9 @@ function drawEjected(nowMs) {
     }
 
     const p = toScreen(item.x, item.y);
-    const radius = Math.max(4.6, Math.sqrt(item.mass) * 5.2 * camera.zoom);
+    const radius = Math.max(3.5, Math.sqrt(item.mass * 100) * camera.zoom);
 
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    traceWobblingDisk(p.x, p.y, radius, item.id, nowMs / 1000, 0.03, 20);
     ctx.fillStyle = "#6FE85A";
     ctx.fill();
     ctx.strokeStyle = "#4BC443";
@@ -438,11 +451,11 @@ function drawEjected(nowMs) {
 }
 
 function worldRadius(blobLike) {
-  return Math.max(12, Math.sqrt(blobLike.mass) * 4);
+  return Math.sqrt(blobLike.mass * 100);
 }
 
 function worldParticleRadius(mass) {
-  return Math.sqrt(mass) * 4;
+  return Math.sqrt(mass * 100);
 }
 
 function findNearbyConsumer(x, y, particleRadius, rangeFactor, blobs) {
@@ -522,12 +535,11 @@ function drawConsumeFx(dt) {
     const p = toScreen(fx.x, fx.y);
     const radiusBase =
       fx.kind === "food"
-        ? Math.max(4.8, Math.sqrt(fx.mass) * 6.8 * camera.zoom)
-        : Math.max(4.6, Math.sqrt(fx.mass) * 5.2 * camera.zoom);
+        ? Math.max(3, Math.sqrt(fx.mass * 100) * camera.zoom)
+        : Math.max(3.5, Math.sqrt(fx.mass * 100) * camera.zoom);
     const radius = radiusBase;
     ctx.globalAlpha = alpha;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, Math.max(0.1, radius), 0, Math.PI * 2);
+    traceWobblingDisk(p.x, p.y, Math.max(0.1, radius), fx.key, performance.now() / 1000);
     ctx.fillStyle = fx.color;
     ctx.fill();
     if (fx.kind === "ejected") {
@@ -762,8 +774,7 @@ function drawBlobShape(blob, timeSec, allBlobs, viruses, foods, ejected) {
   const radius = worldR * camera.zoom;
   const interactors = buildBlobInteractors(blob, allBlobs, viruses);
   const ingestors = buildBlobIngestors(blob, foods, ejected);
-  const deformScale = 1 - clamp((worldR - 24) / 170, 0, 0.34);
-  const minRadiusFactor = 0.58 + clamp((worldR - 22) / 220, 0, 0.1);
+  const deformScale = 1 - clamp((worldR - 24) / 170, 0, 0.28);
 
   const speed = Math.hypot(blob.vx, blob.vy);
   const speedNorm = clamp(speed / 520, 0, 1);
@@ -775,7 +786,7 @@ function drawBlobShape(blob, timeSec, allBlobs, viruses, foods, ejected) {
     moveUy = blob.vy / speed;
   }
 
-  const points = 64;
+  const points = Math.round(clamp(radius, 18, 128));
 
   ctx.beginPath();
   for (let i = 0; i <= points; i += 1) {
@@ -789,17 +800,17 @@ function drawBlobShape(blob, timeSec, allBlobs, viruses, foods, ejected) {
 
     const stretch =
       1 +
-      moveDot * speedNorm * (0.055 * (0.8 + deformScale * 0.2)) -
-      pressure.indent * (0.31 * deformScale) +
-      pressure.bulge * (0.06 * (0.86 + deformScale * 0.14)) +
-      ingest * (0.16 * (0.7 + deformScale * 0.3));
+      moveDot * speedNorm * (0.028 * (0.8 + deformScale * 0.2)) -
+      pressure.indent * (0.14 * deformScale) +
+      pressure.bulge * (0.035 * (0.86 + deformScale * 0.14)) +
+      ingest * (0.09 * (0.7 + deformScale * 0.3));
     const wobbleAmp =
-      radius * (0.008 + speedNorm * 0.008 + Math.min(1.0, pressure.indent) * 0.011) * (0.7 + deformScale * 0.3);
+      radius * (0.004 + speedNorm * 0.004 + Math.min(1.0, pressure.indent) * 0.006) * (0.7 + deformScale * 0.3);
     const wobbleA = Math.sin(timeSec * 7.2 + i * 0.92 + blob.seed * 11.7);
     const wobbleB = Math.sin(timeSec * 11.2 - i * 1.21 + blob.seed * 5.4);
     const wobble = (wobbleA * 0.62 + wobbleB * 0.38) * wobbleAmp;
 
-    const localRadius = Math.max(radius * minRadiusFactor, radius * stretch + wobble);
+    const localRadius = Math.max(radius * 0.76, radius * stretch + wobble);
     const x = center.x + nx * localRadius;
     const y = center.y + ny * localRadius;
 
@@ -811,7 +822,7 @@ function drawBlobShape(blob, timeSec, allBlobs, viruses, foods, ejected) {
 
 function drawVirusShape(virus, timeSec, allBlobs) {
   const center = toScreen(virus.x, virus.y);
-  const worldR = worldRadius(virus) * 1.08;
+  const worldR = worldRadius(virus);
   const radius = worldR * camera.zoom;
   const interactors = buildVirusInteractors(virus, allBlobs);
   let spikes = Math.max(34, Math.round((Math.PI * 2 * worldR) / VIRUS_SPIKE_SPACING_WORLD));
@@ -824,7 +835,7 @@ function drawVirusShape(virus, timeSec, allBlobs) {
     const ny = Math.sin(angle);
     const pressure = sampleContactPressure(nx, ny, interactors);
     const pulse = Math.sin(timeSec * 7.4 + i * 1.17 + virus.id.length * 0.8) * radius * 0.0024;
-    const spike = i % 2 === 0 ? 1.028 : 0.962;
+    const spike = i % 2 === 0 ? 1 + 5 / worldR : 1;
     const deform = spike - pressure.indent * 0.075 + pressure.bulge * 0.025;
     const localRadius = Math.max(radius * 0.78, radius * deform + pulse);
     const x = center.x + nx * localRadius;
@@ -855,11 +866,11 @@ function drawBlobEntity(blob, timeSec, allBlobs, viruses, foods, ejected) {
   ctx.stroke();
 
   const label = blob.name || "Cell";
-  const textSize = Math.max(12, radius * 0.34);
+  const textSize = Math.max(8, Math.max(24, worldRadius(blob) * 0.3) * camera.zoom);
 
-  ctx.font = `700 ${textSize}px "Trebuchet MS", Arial, sans-serif`;
+  ctx.font = `700 ${textSize}px "Ubuntu", Arial, sans-serif`;
   ctx.strokeStyle = "rgba(36, 39, 44, 0.92)";
-  ctx.lineWidth = Math.max(2, textSize * 0.15);
+  ctx.lineWidth = Math.max(1.5, textSize * 0.1);
   ctx.strokeText(label, p.x, p.y);
   ctx.fillStyle = "#ffffff";
   ctx.textAlign = "center";
@@ -899,8 +910,8 @@ function render(nowMs) {
   lastFrameAt = nowMs;
 
   maybeSendInput(nowMs);
+  updateBlobVisuals(nowMs, dt);
   updateCamera(dt);
-  updateBlobVisuals(dt);
 
   ctx.fillStyle = BG_COLOR;
   ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
@@ -915,7 +926,6 @@ function render(nowMs) {
 }
 
 resize();
-updateOverviewButton();
 connect();
 setInterval(() => {
   if (ws?.readyState === WebSocket.OPEN) {

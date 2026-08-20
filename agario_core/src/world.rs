@@ -1,16 +1,11 @@
-//! Rust port of agario/world.py. The structure intentionally mirrors the
-//! Python reference implementation statement-for-statement — same iteration
-//! orders, same RNG draw sites, same float operations (`powf` where Python
-//! uses `**`, `sqrt` where it uses math.sqrt) — so that a world seeded with
-//! the same integer produces the same trajectory and parity tests can compare
-//! the two engines directly.
+//! Authoritative Agar.io-style world simulation shared by live play and RL.
 
 use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
-use crate::config::WorldConfig;
+use crate::config::{WorldConfig, TICK_RATE};
 use crate::rng::PyMt19937;
 
 fn clamp(value: f64, min_value: f64, max_value: f64) -> f64 {
@@ -30,6 +25,25 @@ fn unit_vec(dx: f64, dy: f64) -> (f64, f64) {
     }
     let inv_mag = mag_sq.powf(-0.5);
     (dx * inv_mag, dy * inv_mag)
+}
+
+fn size_from_mass(mass: f64) -> f64 {
+    (mass * 100.0).sqrt()
+}
+
+fn mass_from_size(size: f64) -> f64 {
+    size * size / 100.0
+}
+
+fn boost_step(remaining: &mut f64, dt: f64) -> f64 {
+    if *remaining < 1.0 || dt <= 0.0 {
+        *remaining = 0.0;
+        return 0.0;
+    }
+    let fraction = (TICK_RATE * dt / 9.0).min(1.0);
+    let distance = *remaining * fraction;
+    *remaining = (*remaining - distance).max(0.0);
+    distance
 }
 
 /// Python's round(x, 2) (banker's rounding).
@@ -52,9 +66,10 @@ struct Blob {
     x: f64,
     y: f64,
     mass: f64,
-    vx: f64,
-    vy: f64,
-    can_merge_at: f64,
+    boost_dx: f64,
+    boost_dy: f64,
+    boost_distance: f64,
+    born_at: f64,
     // Actual observed velocity (total position delta per second over the last
     // tick, including steering, boosts, softbody pushes). Not part of the
     // physics — provided for observers (bots/RL) only.
@@ -63,8 +78,8 @@ struct Blob {
 }
 
 impl Blob {
-    fn radius(&self, factor: f64) -> f64 {
-        self.mass.sqrt() * factor
+    fn size(&self) -> f64 {
+        size_from_mass(self.mass)
     }
 }
 
@@ -113,6 +128,21 @@ impl Player {
         }
         (cx / total, cy / total)
     }
+
+    fn camera_center(&self) -> (f64, f64) {
+        let count = self.blobs.len() as f64;
+        if count == 0.0 {
+            return (0.0, 0.0);
+        }
+        self.blobs.iter().fold((0.0, 0.0), |(x, y), blob| {
+            (x + blob.x / count, y + blob.y / count)
+        })
+    }
+
+    fn camera_zoom(&self) -> f64 {
+        let total_size: f64 = self.blobs.iter().map(Blob::size).sum();
+        (64.0 / total_size.max(1.0)).min(1.0).powf(0.4)
+    }
 }
 
 #[derive(Clone)]
@@ -122,6 +152,7 @@ struct Food {
     y: f64,
     mass: f64,
     color: usize, // index into cfg.food_colors
+    grow_elapsed: f64,
 }
 
 #[derive(Clone)]
@@ -131,9 +162,9 @@ struct Ejected {
     y: f64,
     mass: f64,
     owner_id: u64,
-    vx: f64,
-    vy: f64,
-    ttl: f64,
+    boost_dx: f64,
+    boost_dy: f64,
+    boost_distance: f64,
 }
 
 #[derive(Clone)]
@@ -142,6 +173,10 @@ struct Virus {
     x: f64,
     y: f64,
     mass: f64,
+    fed: usize,
+    boost_dx: f64,
+    boost_dy: f64,
+    boost_distance: f64,
 }
 
 /// Spatial grid matching agario/spatial.py semantics: point insertion, rect
@@ -197,9 +232,7 @@ impl Grid {
 }
 
 // ---------------------------------------------------------------------------
-// RL observation encoding — MUST mirror bot_solutions/rl_v1/obs.py exactly.
-// tools/obs_equivalence.py asserts the two encoders agree; run it after
-// touching either side.
+// RL observation encoding used by both training and the live neural plugin.
 // ---------------------------------------------------------------------------
 const OBS_VIEW: f64 = 1400.0;
 const OBS_SPEED_NORM: f64 = 400.0;
@@ -221,13 +254,8 @@ pub const OBS_DIM: usize = OBS_SELF_DIM
     + OBS_N_SECTORS * 2
     + OBS_K_FOOD * OBS_FOOD_F
     + OBS_K_VIRUS * 4;
-const OBS_EAT_RATIO: f64 = 1.12;
-const OBS_VIRUS_MASS: f64 = 144.0;
-const OBS_MIN_SPLIT_MASS: f64 = 90.0;
-const OBS_MAX_BLOBS: usize = 16;
-const OBS_MERGE_DELAY: f64 = 25.0;
-const OBS_SPLIT_TRAVEL: f64 = 275.0;
 const TWO_PI: f64 = std::f64::consts::PI * 2.0;
+type EnemyObservation = (f64, f64, f64, f64, f64, f64, f64, f64, usize, f64);
 
 fn fclamp(v: f64, lo: f64, hi: f64) -> f64 {
     v.max(lo).min(hi)
@@ -292,7 +320,7 @@ impl CoreWorld {
         while world.foods.len() < world.cfg.food_target_count {
             world.spawn_food();
         }
-        for _ in 0..world.cfg.virus_count {
+        for _ in 0..world.cfg.virus_min_count {
             world.spawn_virus();
         }
         world.rebuild_spatial_indexes();
@@ -310,9 +338,7 @@ impl CoreWorld {
         handle.id.strip_prefix('p').unwrap().parse().unwrap()
     }
 
-    pub(crate) fn set_input_raw(
-        &mut self, id: u64, tx: f64, ty: f64, split: bool, eject: bool,
-    ) {
+    pub(crate) fn set_input_raw(&mut self, id: u64, tx: f64, ty: f64, split: bool, eject: bool) {
         if let Some(pos) = self.player_pos(id) {
             let player = &mut self.players[pos];
             player.target_x = tx;
@@ -359,7 +385,13 @@ impl CoreWorld {
 
     /// Nearest threatening enemy blob (mass > my_mass * ratio) within range.
     pub(crate) fn nearest_threat(
-        &self, id: u64, cx: f64, cy: f64, my_mass: f64, ratio: f64, range: f64,
+        &self,
+        id: u64,
+        cx: f64,
+        cy: f64,
+        my_mass: f64,
+        ratio: f64,
+        range: f64,
     ) -> Option<(f64, f64)> {
         let mut best: Option<(f64, f64, f64)> = None;
         for p in &self.players {
@@ -369,7 +401,7 @@ impl CoreWorld {
             for b in &p.blobs {
                 if b.mass > my_mass * ratio {
                     let d = distance_sq(cx, cy, b.x, b.y);
-                    if d < range * range && best.map_or(true, |(_, _, bd)| d < bd) {
+                    if d < range * range && best.is_none_or(|(_, _, bd)| d < bd) {
                         best = Some((b.x, b.y, d));
                     }
                 }
@@ -382,7 +414,7 @@ impl CoreWorld {
         let mut best: Option<(f64, f64, f64)> = None;
         for f in &self.foods {
             let d = distance_sq(cx, cy, f.x, f.y);
-            if best.map_or(true, |(_, _, bd)| d < bd) {
+            if best.is_none_or(|(_, _, bd)| d < bd) {
                 best = Some((f.x, f.y, d));
             }
         }
@@ -394,7 +426,7 @@ impl CoreWorld {
             let current = self.players[pos].total_mass();
             if current > 0.0 {
                 let factor = total_mass / current;
-                let min_mass = self.cfg.min_blob_mass;
+                let min_mass = self.cfg.player_min_mass;
                 for blob in self.players[pos].blobs.iter_mut() {
                     blob.mass = (blob.mass * factor).max(min_mass);
                 }
@@ -408,7 +440,11 @@ impl CoreWorld {
 
     /// GIL-free observation encode by numeric player id.
     pub(crate) fn observe_by_id(
-        &self, id: u64, now: f64, control: (usize, usize, usize, f64), out: &mut [f32],
+        &self,
+        id: u64,
+        now: f64,
+        control: (usize, usize, usize, f64),
+        out: &mut [f32],
     ) {
         if let Some(pos) = self.player_pos(id) {
             self.observe_one(pos, now, control, out);
@@ -425,27 +461,87 @@ impl CoreWorld {
         self.players.iter().position(|p| p.id == id)
     }
 
-    fn random_spawn(&mut self, radius: f64) -> (f64, f64) {
-        let x = self.rng.uniform(radius, self.cfg.world_width - radius);
-        let y = self.rng.uniform(radius, self.cfg.world_height - radius);
+    fn random_spawn(&mut self, size: f64) -> (f64, f64) {
+        let r = size * 0.5;
+        let x = self.rng.uniform(r, self.cfg.world_width - r);
+        let y = self.rng.uniform(r, self.cfg.world_height - r);
         (x, y)
     }
 
+    fn safe_spawn(&mut self, size: f64) -> (f64, f64) {
+        for _ in 0..self.cfg.safe_spawn_tries {
+            let pos = self.random_spawn(size);
+            if self.spawn_is_safe(pos.0, pos.1, size) {
+                return pos;
+            }
+        }
+        self.random_spawn(size)
+    }
+
+    fn spawn_is_safe(&self, x: f64, y: f64, size: f64) -> bool {
+        self.players
+            .iter()
+            .flat_map(|p| &p.blobs)
+            .all(|b| distance_sq(x, y, b.x, b.y) >= (size + b.size()).powi(2))
+            && self
+                .viruses
+                .iter()
+                .all(|v| distance_sq(x, y, v.x, v.y) >= (size + size_from_mass(v.mass)).powi(2))
+    }
+
+    fn player_spawn(&mut self, size: f64) -> (f64, f64) {
+        if !self.ejected.is_empty() && self.rng.random() < self.cfg.spawn_from_ejected_chance {
+            for _ in 0..self.cfg.safe_spawn_tries {
+                let index = self.rng.choice_index(self.ejected.len());
+                let item = &self.ejected[index];
+                if self.spawn_is_safe(item.x, item.y, size) {
+                    let pos = (item.x, item.y);
+                    self.ejected.swap_remove(index);
+                    return pos;
+                }
+            }
+        }
+        self.safe_spawn(size)
+    }
+
+    fn merge_ready_at(&self, blob: &Blob) -> f64 {
+        blob.born_at
+            + self.cfg.player_no_merge_seconds.max(
+                self.cfg.player_merge_seconds + blob.size() * self.cfg.player_merge_size_factor,
+            )
+    }
+
     fn spawn_food(&mut self) {
-        let (fx, fy) = self.random_spawn(8.0);
-        let mass = self.rng.uniform(self.cfg.food_min_mass, self.cfg.food_max_mass);
+        let (fx, fy) = self.safe_spawn(size_from_mass(self.cfg.food_min_mass));
+        let mass = self.cfg.food_min_mass;
         let color = self.rng.choice_index(self.cfg.food_colors.len());
         let id = self.next_food_id;
         self.next_food_id += 1;
-        self.foods.push(Food { id, x: fx, y: fy, mass, color });
+        self.foods.push(Food {
+            id,
+            x: fx,
+            y: fy,
+            mass,
+            color,
+            grow_elapsed: 0.0,
+        });
     }
 
     fn spawn_virus(&mut self) {
-        let (vx, vy) = self.random_spawn(80.0);
+        let (vx, vy) = self.safe_spawn(size_from_mass(self.cfg.virus_mass));
         let id = self.next_virus_id;
         self.next_virus_id += 1;
         let mass = self.cfg.virus_mass;
-        self.viruses.push(Virus { id, x: vx, y: vy, mass });
+        self.viruses.push(Virus {
+            id,
+            x: vx,
+            y: vy,
+            mass,
+            fed: 0,
+            boost_dx: 0.0,
+            boost_dy: 0.0,
+            boost_distance: 0.0,
+        });
     }
 
     fn respawn_eliminated_players(&mut self, now: f64) {
@@ -453,7 +549,7 @@ impl CoreWorld {
             if !self.players[pi].blobs.is_empty() {
                 continue;
             }
-            let (x, y) = self.random_spawn(40.0);
+            let (x, y) = self.player_spawn(size_from_mass(self.cfg.player_start_mass));
             let blob_id = self.next_blob_id;
             self.next_blob_id += 1;
             let player = &mut self.players[pi];
@@ -464,9 +560,10 @@ impl CoreWorld {
                 x,
                 y,
                 mass: self.cfg.player_start_mass,
-                vx: 0.0,
-                vy: 0.0,
-                can_merge_at: now + self.cfg.merge_delay_seconds,
+                boost_dx: 0.0,
+                boost_dy: 0.0,
+                boost_distance: 0.0,
+                born_at: now,
                 obs_vx: 0.0,
                 obs_vy: 0.0,
             });
@@ -491,7 +588,7 @@ impl CoreWorld {
     fn split_player(&mut self, pi: usize, now: f64) {
         let cfg = &self.cfg;
         let player = &self.players[pi];
-        if now - player.last_split_at < cfg.split_cooldown_seconds {
+        if now - player.last_split_at < cfg.action_cooldown_seconds {
             return;
         }
         if player.blobs.len() >= cfg.max_player_blobs {
@@ -520,10 +617,8 @@ impl CoreWorld {
             let split_mass = blob.mass / 2.0;
             let blob = &mut self.players[pi].blobs[bi];
             blob.mass = split_mass;
-            blob.can_merge_at = now + self.cfg.merge_delay_seconds;
 
-            let offset = blob.radius(self.cfg.blob_radius_factor)
-                + split_mass.powf(0.5) * self.cfg.blob_radius_factor;
+            let offset = self.cfg.player_split_distance;
             let bx = blob.x;
             let by = blob.y;
             let blob_id = self.next_blob_id;
@@ -534,9 +629,10 @@ impl CoreWorld {
                 x: clamp(bx + ux * offset, 0.0, self.cfg.world_width),
                 y: clamp(by + uy * offset, 0.0, self.cfg.world_height),
                 mass: split_mass,
-                vx: ux * self.cfg.split_boost_speed,
-                vy: uy * self.cfg.split_boost_speed,
-                can_merge_at: now + self.cfg.merge_delay_seconds,
+                boost_dx: ux,
+                boost_dy: uy,
+                boost_distance: self.cfg.player_split_boost,
+                born_at: now,
                 obs_vx: 0.0,
                 obs_vy: 0.0,
             });
@@ -550,7 +646,7 @@ impl CoreWorld {
     }
 
     fn eject_player_mass(&mut self, pi: usize, now: f64) {
-        if now - self.players[pi].last_eject_at < self.cfg.eject_cooldown_seconds {
+        if now - self.players[pi].last_eject_at < self.cfg.action_cooldown_seconds {
             return;
         }
 
@@ -561,23 +657,28 @@ impl CoreWorld {
 
         for bi in 0..self.players[pi].blobs.len() {
             let blob = &self.players[pi].blobs[bi];
-            if blob.mass <= self.cfg.player_min_eject_mass {
+            if blob.mass < self.cfg.player_min_eject_mass {
                 continue;
             }
-            let remaining_mass = blob.mass - self.cfg.player_eject_mass;
-            if remaining_mass < self.cfg.min_blob_mass {
+            let remaining_mass = blob.mass - self.cfg.eject_loss_mass;
+            if remaining_mass < self.cfg.player_min_mass {
                 continue;
             }
 
             let dx = target_x - blob.x;
             let dy = target_y - blob.y;
             let (ux, uy) = unit_vec(dx, dy);
+            let size = blob.size();
 
+            let angle = uy.atan2(ux)
+                + self
+                    .rng
+                    .uniform(-self.cfg.eject_dispersion, self.cfg.eject_dispersion);
+            let (eject_dx, eject_dy) = (angle.cos(), angle.sin());
             let blob = &mut self.players[pi].blobs[bi];
             blob.mass = remaining_mass;
-            let radius = blob.radius(self.cfg.blob_radius_factor);
-            let eject_x = blob.x + ux * (radius + 12.0);
-            let eject_y = blob.y + uy * (radius + 12.0);
+            let eject_x = blob.x + ux * size;
+            let eject_y = blob.y + uy * size;
 
             let id = self.next_ejected_id;
             self.next_ejected_id += 1;
@@ -585,11 +686,11 @@ impl CoreWorld {
                 id,
                 x: clamp(eject_x, 0.0, self.cfg.world_width),
                 y: clamp(eject_y, 0.0, self.cfg.world_height),
-                mass: self.cfg.player_eject_mass,
+                mass: self.cfg.ejected_mass,
                 owner_id,
-                vx: ux * self.cfg.eject_boost_speed,
-                vy: uy * self.cfg.eject_boost_speed,
-                ttl: self.cfg.ejected_mass_lifetime,
+                boost_dx: eject_dx,
+                boost_dy: eject_dy,
+                boost_distance: self.cfg.ejected_boost,
             });
             spawned_any = true;
         }
@@ -600,8 +701,6 @@ impl CoreWorld {
     }
 
     fn move_blobs(&mut self, dt: f64, now: f64) {
-        let damping = (1.0 - self.cfg.boost_damping * dt).max(0.0);
-
         for pi in 0..self.players.len() {
             {
                 let cfg = &self.cfg;
@@ -611,23 +710,22 @@ impl CoreWorld {
                 for blob in player.blobs.iter_mut() {
                     let dx = target_x - blob.x;
                     let dy = target_y - blob.y;
+                    let distance = (dx * dx + dy * dy).sqrt();
                     let (ux, uy) = unit_vec(dx, dy);
-                    let input_distance = (dx * dx + dy * dy).powf(0.5);
-                    let input_excess = (input_distance - cfg.input_deadzone_world).max(0.0);
-                    let ramp = cfg.input_speed_ramp_world.max(1.0);
-                    let ease_power = cfg.input_speed_ease_exponent.max(0.25);
-                    let eased_distance = (input_excess / ramp).powf(ease_power);
-                    let input_scale = 1.0 - (-eased_distance).exp();
-
-                    let max_speed = cfg
-                        .player_min_speed
-                        .max(cfg.player_base_speed / blob.mass.powf(cfg.speed_exponent));
-                    let speed = max_speed * input_scale;
-
-                    blob.x += (ux * speed + blob.vx) * dt;
-                    blob.y += (uy * speed + blob.vy) * dt;
-                    blob.vx *= damping;
-                    blob.vy *= damping;
+                    let boost = boost_step(&mut blob.boost_distance, dt);
+                    blob.x += blob.boost_dx * boost;
+                    blob.y += blob.boost_dy * boost;
+                    if distance >= 1.0 {
+                        let movement = (88.0
+                            * blob.size().powf(-0.439_675_4)
+                            * cfg.player_move_mult
+                            * TICK_RATE
+                            * dt
+                            * (distance / 32.0).min(1.0))
+                        .min(distance);
+                        blob.x += ux * movement;
+                        blob.y += uy * movement;
+                    }
                 }
             }
 
@@ -636,10 +734,15 @@ impl CoreWorld {
             let cfg = &self.cfg;
             let player = &mut self.players[pi];
             for blob in player.blobs.iter_mut() {
-                let radius = blob.mass.sqrt() * cfg.blob_radius_factor;
-                let clamp_r = radius * cfg.blob_boundary_factor;
-                blob.x = clamp(blob.x, clamp_r, cfg.world_width - clamp_r);
-                blob.y = clamp(blob.y, clamp_r, cfg.world_height - clamp_r);
+                let r = blob.size() * 0.5;
+                if blob.x < r || blob.x > cfg.world_width - r {
+                    blob.boost_dx = -blob.boost_dx;
+                }
+                if blob.y < r || blob.y > cfg.world_height - r {
+                    blob.boost_dy = -blob.boost_dy;
+                }
+                blob.x = clamp(blob.x, r, cfg.world_width - r);
+                blob.y = clamp(blob.y, r, cfg.world_height - r);
             }
         }
     }
@@ -652,20 +755,27 @@ impl CoreWorld {
 
         for i in 0..n {
             for j in (i + 1)..n {
-                let (a_x, a_y, a_r, a_merge) = {
+                let (a_x, a_y, a_r, a_born, a_merge) = {
                     let a = &self.players[pi].blobs[i];
-                    (a.x, a.y, a.radius(self.cfg.blob_radius_factor), a.can_merge_at)
+                    (a.x, a.y, a.size(), a.born_at, self.merge_ready_at(a))
                 };
-                let (b_x, b_y, b_r, b_merge) = {
+                let (b_x, b_y, b_r, b_born, b_merge) = {
                     let b = &self.players[pi].blobs[j];
-                    (b.x, b.y, b.radius(self.cfg.blob_radius_factor), b.can_merge_at)
+                    (b.x, b.y, b.size(), b.born_at, self.merge_ready_at(b))
                 };
+
+                if now - a_born < self.cfg.player_no_collide_seconds
+                    || now - b_born < self.cfg.player_no_collide_seconds
+                    || (now >= a_merge && now >= b_merge)
+                {
+                    continue;
+                }
 
                 let mut dx = b_x - a_x;
                 let mut dy = b_y - a_y;
                 let mut dist_sq = dx * dx + dy * dy;
                 if dist_sq <= 1e-8 {
-                    let theta = self.rng.random() * 6.283185;
+                    let theta = self.rng.random() * TWO_PI;
                     dx = theta.cos();
                     dy = theta.sin();
                     dist_sq = 1.0;
@@ -676,43 +786,20 @@ impl CoreWorld {
                 let uy = dy / dist;
 
                 let touch = a_r + b_r;
-                let ready_to_merge = now >= a_merge && now >= b_merge;
-
-                let min_dist = if ready_to_merge {
-                    touch * self.cfg.softbody_min_dist_merged
-                } else {
-                    touch
-                };
-
-                // Keep blobs from collapsing into one center; preserves the
-                // squishy contact feel.
-                if dist < min_dist {
-                    let correction = (min_dist - dist) * 0.5;
+                if dist < touch {
+                    let overlap = touch - dist;
+                    let total_mass =
+                        self.players[pi].blobs[i].mass + self.players[pi].blobs[j].mass;
+                    let a_share = self.players[pi].blobs[j].mass / total_mass;
+                    let b_share = self.players[pi].blobs[i].mass / total_mass;
                     let blobs = &mut self.players[pi].blobs;
-                    blobs[i].x -= ux * correction;
-                    blobs[i].y -= uy * correction;
-                    blobs[j].x += ux * correction;
-                    blobs[j].y += uy * correction;
+                    blobs[i].x -= ux * overlap * a_share;
+                    blobs[i].y -= uy * overlap * a_share;
+                    blobs[j].x += ux * overlap * b_share;
+                    blobs[j].y += uy * overlap * b_share;
                 }
             }
         }
-    }
-
-    fn mass_decay_rate(&self, total_mass: f64) -> f64 {
-        let cfg = &self.cfg;
-        if total_mass <= cfg.mass_decay_start {
-            return cfg.mass_decay_min_rate;
-        }
-        if total_mass >= cfg.mass_decay_end {
-            return cfg.mass_decay_max_rate;
-        }
-        let span = cfg.mass_decay_end - cfg.mass_decay_start;
-        if span <= 0.0 {
-            return cfg.mass_decay_max_rate;
-        }
-        let t = clamp((total_mass - cfg.mass_decay_start) / span, 0.0, 1.0);
-        let eased = t.powf(cfg.mass_decay_curve.max(0.05));
-        cfg.mass_decay_min_rate + (cfg.mass_decay_max_rate - cfg.mass_decay_min_rate) * eased
     }
 
     fn apply_mass_decay(&mut self, dt: f64) {
@@ -723,38 +810,68 @@ impl CoreWorld {
             if self.players[pi].blobs.is_empty() {
                 continue;
             }
-            let rate = self.mass_decay_rate(self.players[pi].total_mass());
-            if rate <= 0.0 {
-                continue;
-            }
-            let min_mass = self.cfg.min_blob_mass;
+            let min_mass = self.cfg.player_min_mass;
             for blob in self.players[pi].blobs.iter_mut() {
                 if blob.mass <= min_mass {
                     continue;
                 }
-                let decayed = blob.mass - blob.mass * rate * dt;
-                blob.mass = decayed.max(min_mass);
+                let size = blob.size();
+                let next = size - size * self.cfg.player_decay_mult / 50.0 * TICK_RATE * dt;
+                blob.mass = mass_from_size(next).max(min_mass);
             }
         }
     }
 
     fn move_ejected(&mut self, dt: f64) {
-        let damping = (1.0 - self.cfg.boost_damping * dt).max(0.0);
         let cfg = &self.cfg;
 
         for ejected in self.ejected.iter_mut() {
-            ejected.x += ejected.vx * dt;
-            ejected.y += ejected.vy * dt;
-            ejected.vx *= damping;
-            ejected.vy *= damping;
-            ejected.ttl -= dt;
-
-            let radius = ejected.mass.sqrt() * cfg.blob_radius_factor;
-            ejected.x = clamp(ejected.x, radius, cfg.world_width - radius);
-            ejected.y = clamp(ejected.y, radius, cfg.world_height - radius);
+            let movement = boost_step(&mut ejected.boost_distance, dt);
+            ejected.x += ejected.boost_dx * movement;
+            ejected.y += ejected.boost_dy * movement;
+            let r = size_from_mass(ejected.mass) * 0.5;
+            if ejected.x < r || ejected.x > cfg.world_width - r {
+                ejected.boost_dx = -ejected.boost_dx;
+            }
+            if ejected.y < r || ejected.y > cfg.world_height - r {
+                ejected.boost_dy = -ejected.boost_dy;
+            }
+            ejected.x = clamp(ejected.x, r, cfg.world_width - r);
+            ejected.y = clamp(ejected.y, r, cfg.world_height - r);
         }
+    }
 
-        self.ejected.retain(|e| e.ttl > 0.0);
+    fn resolve_ejected_collisions(&mut self) {
+        for i in 0..self.ejected.len() {
+            for j in (i + 1)..self.ejected.len() {
+                let (left, right) = self.ejected.split_at_mut(j);
+                let a = &mut left[i];
+                let b = &mut right[0];
+                let mut dx = b.x - a.x;
+                let mut dy = b.y - a.y;
+                let mut distance = dx.hypot(dy);
+                let overlap = size_from_mass(a.mass) + size_from_mass(b.mass) - distance;
+                if overlap <= 0.0 {
+                    continue;
+                }
+                if distance <= 1e-9 {
+                    dx = 1.0;
+                    dy = 0.0;
+                    distance = 1.0;
+                }
+                let total = a.mass + b.mass;
+                let (ux, uy) = (dx / distance, dy / distance);
+                a.x -= ux * overlap * b.mass / total;
+                a.y -= uy * overlap * b.mass / total;
+                b.x += ux * overlap * a.mass / total;
+                b.y += uy * overlap * a.mass / total;
+            }
+        }
+        for item in &mut self.ejected {
+            let r = size_from_mass(item.mass) * 0.5;
+            item.x = clamp(item.x, r, self.cfg.world_width - r);
+            item.y = clamp(item.y, r, self.cfg.world_height - r);
+        }
     }
 
     fn rebuild_spatial_indexes(&mut self) {
@@ -788,19 +905,24 @@ impl CoreWorld {
             for bi in 0..self.players[pi].blobs.len() {
                 let (bx, by, radius) = {
                     let blob = &self.players[pi].blobs[bi];
-                    (blob.x, blob.y, blob.radius(self.cfg.blob_radius_factor))
+                    (blob.x, blob.y, blob.size())
                 };
-                self.food_grid
-                    .query_rect(bx - radius, by - radius, bx + radius, by + radius, &mut nearby);
+                self.food_grid.query_rect(
+                    bx - radius,
+                    by - radius,
+                    bx + radius,
+                    by + radius,
+                    &mut nearby,
+                );
                 for &fi in nearby.iter() {
                     if eaten.contains(&fi) {
                         continue;
                     }
                     let food = &self.foods[fi];
                     let blob = &self.players[pi].blobs[bi];
-                    let blob_radius = blob.radius(self.cfg.blob_radius_factor);
-                    let food_radius = food.mass.sqrt() * self.cfg.food_radius_factor;
-                    let eat_dist = (blob_radius + food_radius) * self.cfg.food_eat_range_factor;
+                    let blob_radius = blob.size();
+                    let food_radius = size_from_mass(food.mass);
+                    let eat_dist = blob_radius - food_radius / self.cfg.eat_overlap_divisor;
                     if distance_sq(blob.x, blob.y, food.x, food.y) <= eat_dist * eat_dist {
                         let food_mass = food.mass;
                         self.players[pi].blobs[bi].mass += food_mass;
@@ -825,29 +947,30 @@ impl CoreWorld {
         let mut nearby: Vec<usize> = Vec::new();
 
         for pi in 0..self.players.len() {
-            let player_id = self.players[pi].id;
             for bi in 0..self.players[pi].blobs.len() {
                 let (bx, by, radius) = {
                     let blob = &self.players[pi].blobs[bi];
-                    (blob.x, blob.y, blob.radius(self.cfg.blob_radius_factor))
+                    (blob.x, blob.y, blob.size())
                 };
-                self.ejected_grid
-                    .query_rect(bx - radius, by - radius, bx + radius, by + radius, &mut nearby);
+                self.ejected_grid.query_rect(
+                    bx - radius,
+                    by - radius,
+                    bx + radius,
+                    by + radius,
+                    &mut nearby,
+                );
                 for &ei in nearby.iter() {
                     if consumed.contains(&ei) {
                         continue;
                     }
                     let ejected = &self.ejected[ei];
-                    if ejected.owner_id == player_id
-                        && ejected.ttl > self.cfg.ejected_mass_lifetime - 0.35
-                    {
+                    let blob = &self.players[pi].blobs[bi];
+                    let blob_radius = blob.size();
+                    let ejected_radius = size_from_mass(ejected.mass);
+                    if blob_radius < ejected_radius * self.cfg.eat_size_ratio {
                         continue;
                     }
-                    let blob = &self.players[pi].blobs[bi];
-                    let blob_radius = blob.radius(self.cfg.blob_radius_factor);
-                    let ejected_radius = ejected.mass.sqrt() * self.cfg.blob_radius_factor;
-                    let eat_dist =
-                        (blob_radius + ejected_radius) * self.cfg.ejected_eat_range_factor;
+                    let eat_dist = blob_radius - ejected_radius / self.cfg.eat_overlap_divisor;
                     if distance_sq(blob.x, blob.y, ejected.x, ejected.y) <= eat_dist * eat_dist {
                         let ejected_mass = ejected.mass;
                         self.players[pi].blobs[bi].mass += ejected_mass;
@@ -889,7 +1012,7 @@ impl CoreWorld {
 
             let (bx, by, radius) = {
                 let blob = &flat[i];
-                (blob.x, blob.y, blob.radius(self.cfg.blob_radius_factor))
+                (blob.x, blob.y, blob.size())
             };
             self.blob_grid.query_rect(
                 bx - radius * 2.0,
@@ -913,17 +1036,22 @@ impl CoreWorld {
                     continue;
                 }
 
-                let (big, small) = if flat[i].mass >= flat[j].mass { (i, j) } else { (j, i) };
+                let (big, small) = if flat[i].mass >= flat[j].mass {
+                    (i, j)
+                } else {
+                    (j, i)
+                };
                 let dist_sq = distance_sq(flat[big].x, flat[big].y, flat[small].x, flat[small].y);
-                let big_radius = flat[big].radius(self.cfg.blob_radius_factor);
-                let small_radius = flat[small].radius(self.cfg.blob_radius_factor);
+                let big_radius = flat[big].size();
+                let small_radius = flat[small].size();
 
                 if flat[big].player_id == flat[small].player_id {
-                    if now < flat[big].can_merge_at || now < flat[small].can_merge_at {
+                    if now < self.merge_ready_at(&flat[big])
+                        || now < self.merge_ready_at(&flat[small])
+                    {
                         continue;
                     }
-                    let merge_distance =
-                        big_radius - small_radius * self.cfg.merge_coverage_fraction;
+                    let merge_distance = big_radius - small_radius / self.cfg.eat_overlap_divisor;
                     if merge_distance <= 0.0 {
                         continue;
                     }
@@ -935,11 +1063,11 @@ impl CoreWorld {
                     continue;
                 }
 
-                if flat[big].mass < flat[small].mass * self.cfg.blob_eat_ratio {
+                if big_radius < small_radius * self.cfg.eat_size_ratio {
                     continue;
                 }
 
-                let eat_distance = big_radius - small_radius * self.cfg.blob_eat_overlap;
+                let eat_distance = big_radius - small_radius / self.cfg.eat_overlap_divisor;
                 if eat_distance <= 0.0 {
                     continue;
                 }
@@ -969,107 +1097,264 @@ impl CoreWorld {
         }
     }
 
-    fn resolve_virus_blob_collisions(&mut self, now: f64) {
-        let mut consumed: HashSet<u64> = HashSet::new();
+    fn move_viruses(&mut self, dt: f64) {
+        for virus in &mut self.viruses {
+            let movement = boost_step(&mut virus.boost_distance, dt);
+            virus.x += virus.boost_dx * movement;
+            virus.y += virus.boost_dy * movement;
+            let r = size_from_mass(virus.mass) * 0.5;
+            if virus.x < r || virus.x > self.cfg.world_width - r {
+                virus.boost_dx = -virus.boost_dx;
+            }
+            if virus.y < r || virus.y > self.cfg.world_height - r {
+                virus.boost_dy = -virus.boost_dy;
+            }
+            virus.x = clamp(virus.x, r, self.cfg.world_width - r);
+            virus.y = clamp(virus.y, r, self.cfg.world_height - r);
+        }
+    }
 
+    fn resolve_virus_ejected_collisions(&mut self) {
+        if self.viruses.len() >= self.cfg.virus_max_count {
+            return;
+        }
+        let mut eaten = HashSet::new();
+        let mut children = Vec::new();
+        for vi in 0..self.viruses.len() {
+            for ei in 0..self.ejected.len() {
+                if eaten.contains(&ei)
+                    || self.viruses.len() + children.len() >= self.cfg.virus_max_count
+                {
+                    continue;
+                }
+                let vsize = size_from_mass(self.viruses[vi].mass);
+                let esize = size_from_mass(self.ejected[ei].mass);
+                let reach = vsize - esize / self.cfg.eat_overlap_divisor;
+                if distance_sq(
+                    self.viruses[vi].x,
+                    self.viruses[vi].y,
+                    self.ejected[ei].x,
+                    self.ejected[ei].y,
+                ) > reach * reach
+                {
+                    continue;
+                }
+                let direction = unit_vec(self.ejected[ei].boost_dx, self.ejected[ei].boost_dy);
+                eaten.insert(ei);
+                self.viruses[vi].fed += 1;
+                if self.viruses[vi].fed >= self.cfg.virus_feed_times {
+                    self.viruses[vi].fed = 0;
+                    self.viruses[vi].mass = self.cfg.virus_mass;
+                    children.push((self.viruses[vi].x, self.viruses[vi].y, direction));
+                } else {
+                    self.viruses[vi].mass += self.ejected[ei].mass;
+                }
+            }
+        }
+        if !eaten.is_empty() {
+            let mut index = 0;
+            self.ejected.retain(|_| {
+                let keep = !eaten.contains(&index);
+                index += 1;
+                keep
+            });
+        }
+        for (x, y, (dx, dy)) in children {
+            let id = self.next_virus_id;
+            self.next_virus_id += 1;
+            self.viruses.push(Virus {
+                id,
+                x,
+                y,
+                mass: self.cfg.virus_mass,
+                fed: 0,
+                boost_dx: dx,
+                boost_dy: dy,
+                boost_distance: self.cfg.virus_split_boost,
+            });
+        }
+    }
+
+    fn resolve_virus_blob_collisions(&mut self, now: f64) {
+        let mut consumed = HashSet::new();
         for pi in 0..self.players.len() {
             let blob_ids: Vec<u64> = self.players[pi].blobs.iter().map(|b| b.id).collect();
             for blob_id in blob_ids {
                 let Some(bi) = self.players[pi].blobs.iter().position(|b| b.id == blob_id) else {
                     continue;
                 };
-
                 for vi in 0..self.viruses.len() {
-                    let virus_id = self.viruses[vi].id;
-                    if consumed.contains(&virus_id) {
+                    if consumed.contains(&self.viruses[vi].id) {
                         continue;
                     }
-                    let virus_mass = self.viruses[vi].mass;
-                    let blob = &self.players[pi].blobs[bi];
-                    if blob.mass < virus_mass * 1.15 {
+                    let bsize = self.players[pi].blobs[bi].size();
+                    let vsize = size_from_mass(self.viruses[vi].mass);
+                    if bsize < vsize * self.cfg.eat_size_ratio {
                         continue;
                     }
-                    let virus_radius = virus_mass.sqrt() * self.cfg.virus_radius_factor;
-                    let trigger_distance =
-                        blob.radius(self.cfg.blob_radius_factor) - virus_radius * 0.18;
-                    if trigger_distance <= 0.0 {
-                        continue;
-                    }
-                    let (vx, vy) = (self.viruses[vi].x, self.viruses[vi].y);
-                    if distance_sq(blob.x, blob.y, vx, vy)
-                        <= trigger_distance * trigger_distance
+                    let reach = bsize - vsize / self.cfg.eat_overlap_divisor;
+                    if distance_sq(
+                        self.players[pi].blobs[bi].x,
+                        self.players[pi].blobs[bi].y,
+                        self.viruses[vi].x,
+                        self.viruses[vi].y,
+                    ) <= reach * reach
                     {
-                        self.players[pi].blobs[bi].mass += self.cfg.virus_bonus_mass;
+                        self.players[pi].blobs[bi].mass += self.viruses[vi].mass;
                         self.explode_blob_into_player(pi, bi, now);
-                        consumed.insert(virus_id);
+                        consumed.insert(self.viruses[vi].id);
                         break;
                     }
                 }
             }
         }
+        self.viruses.retain(|v| !consumed.contains(&v.id));
+    }
 
-        if !consumed.is_empty() {
-            self.viruses.retain(|v| !consumed.contains(&v.id));
-            for _ in 0..consumed.len() {
-                self.spawn_virus();
-            }
+    fn virus_pop_masses(&self, cell_mass: f64, cells_left: usize) -> Vec<f64> {
+        if cells_left == 0 {
+            return Vec::new();
         }
+        let split_min = self.cfg.player_min_split_mass;
+        if cell_mass / (cells_left as f64) < split_min {
+            let mut amount = 2usize;
+            while cell_mass / (amount + 1) as f64 >= split_min && amount * 2 <= cells_left {
+                amount *= 2;
+            }
+            return vec![cell_mass / (amount + 1) as f64; amount];
+        }
+
+        let mut splits = Vec::new();
+        let mut next_mass = cell_mass / 2.0;
+        let mut mass_left = cell_mass / 2.0;
+        let mut slots = cells_left;
+        while slots > 0 {
+            if next_mass / (slots as f64) < split_min {
+                break;
+            }
+            while next_mass >= mass_left && slots > 1 {
+                next_mass /= 2.0;
+            }
+            splits.push(next_mass);
+            mass_left -= next_mass;
+            slots -= 1;
+        }
+        if slots > 0 {
+            splits.extend(vec![mass_left / slots as f64; slots]);
+        }
+        splits
     }
 
     fn explode_blob_into_player(&mut self, pi: usize, bi: usize, now: f64) {
-        let cfg_max = self.cfg.max_player_blobs;
-        let available_slots = cfg_max as i64 - self.players[pi].blobs.len() as i64 + 1;
-        if available_slots <= 1 {
-            return;
-        }
-
-        let blob_mass = self.players[pi].blobs[bi].mass;
-        let mut split_parts = (blob_mass / 30.0) as i64;
-        split_parts = split_parts.max(self.cfg.virus_split_min_parts as i64);
-        split_parts = split_parts
-            .min(self.cfg.virus_split_max_parts as i64)
-            .min(available_slots);
-        if split_parts <= 1 {
-            return;
-        }
-
-        let total_mass = blob_mass;
-        let (base_x, base_y) = {
-            let blob = &self.players[pi].blobs[bi];
-            (blob.x, blob.y)
-        };
-        let player_id = self.players[pi].id;
-
-        self.players[pi].blobs.remove(bi);
-
-        let part_mass = total_mass / split_parts as f64;
-        for idx in 0..split_parts {
-            let angle =
-                (idx as f64 / split_parts as f64) * 6.283185 + self.rng.uniform(-0.15, 0.15);
-            let (ux, uy) = (angle.cos(), angle.sin());
-            let blob_id = self.next_blob_id;
+        let cells_left = self
+            .cfg
+            .max_player_blobs
+            .saturating_sub(self.players[pi].blobs.len());
+        let splits = self.virus_pop_masses(self.players[pi].blobs[bi].mass, cells_left);
+        for mass in splits {
+            if mass <= 0.0 || mass >= self.players[pi].blobs[bi].mass {
+                continue;
+            }
+            let angle = self.rng.uniform(0.0, TWO_PI);
+            let (dx, dy) = (angle.sin(), angle.cos());
+            let (x, y, player_id) = {
+                let parent = &mut self.players[pi].blobs[bi];
+                parent.mass -= mass;
+                (parent.x, parent.y, parent.player_id)
+            };
+            let id = self.next_blob_id;
             self.next_blob_id += 1;
-            let damp_x = self.rng.uniform(0.62, 0.92);
-            let damp_y = self.rng.uniform(0.62, 0.92);
-            let blob = Blob {
-                id: blob_id,
+            self.players[pi].blobs.push(Blob {
+                id,
                 player_id,
-                x: clamp(base_x + ux * 14.0, 0.0, self.cfg.world_width),
-                y: clamp(base_y + uy * 14.0, 0.0, self.cfg.world_height),
-                mass: part_mass,
-                vx: ux * self.cfg.split_boost_speed * damp_x,
-                vy: uy * self.cfg.split_boost_speed * damp_y,
-                can_merge_at: now + self.cfg.merge_delay_seconds,
+                x: clamp(
+                    x + dx * self.cfg.player_split_distance,
+                    0.0,
+                    self.cfg.world_width,
+                ),
+                y: clamp(
+                    y + dy * self.cfg.player_split_distance,
+                    0.0,
+                    self.cfg.world_height,
+                ),
+                mass,
+                boost_dx: dx,
+                boost_dy: dy,
+                boost_distance: self.cfg.player_split_boost,
+                born_at: now,
                 obs_vx: 0.0,
                 obs_vy: 0.0,
-            };
-            self.players[pi].blobs.push(blob);
+            });
         }
     }
 
-    fn spawn_food_to_target(&mut self) {
+    fn maintain_world_entities(&mut self, dt: f64) {
+        for food in &mut self.foods {
+            food.grow_elapsed += dt;
+            while food.mass < self.cfg.food_max_mass
+                && food.grow_elapsed > self.cfg.food_grow_seconds
+            {
+                food.mass = (food.mass + 1.0).min(self.cfg.food_max_mass);
+                food.grow_elapsed -= self.cfg.food_grow_seconds;
+            }
+        }
         while self.foods.len() < self.cfg.food_target_count {
             self.spawn_food();
+        }
+        while self.viruses.len() < self.cfg.virus_min_count {
+            self.spawn_virus();
+        }
+    }
+
+    fn autosplit_players(&mut self, now: f64) {
+        for pi in 0..self.players.len() {
+            let ids: Vec<u64> = self.players[pi].blobs.iter().map(|b| b.id).collect();
+            for id in ids {
+                let Some(bi) = self.players[pi].blobs.iter().position(|b| b.id == id) else {
+                    continue;
+                };
+                let cells_left = 1 + self.cfg.max_player_blobs - self.players[pi].blobs.len();
+                let overflow =
+                    (self.players[pi].blobs[bi].mass / self.cfg.player_max_mass).ceil() as usize;
+                if overflow <= 1 || cells_left == 0 {
+                    continue;
+                }
+                let pieces = overflow.min(cells_left);
+                let split_mass =
+                    (self.players[pi].blobs[bi].mass / pieces as f64).min(self.cfg.player_max_mass);
+                for _ in 1..pieces {
+                    let angle = self.rng.uniform(0.0, TWO_PI);
+                    let (dx, dy) = (angle.sin(), angle.cos());
+                    let (x, y, player_id) = {
+                        let parent = &mut self.players[pi].blobs[bi];
+                        parent.mass -= split_mass;
+                        (parent.x, parent.y, parent.player_id)
+                    };
+                    let blob_id = self.next_blob_id;
+                    self.next_blob_id += 1;
+                    self.players[pi].blobs.push(Blob {
+                        id: blob_id,
+                        player_id,
+                        x: clamp(
+                            x + dx * self.cfg.player_split_distance,
+                            0.0,
+                            self.cfg.world_width,
+                        ),
+                        y: clamp(
+                            y + dy * self.cfg.player_split_distance,
+                            0.0,
+                            self.cfg.world_height,
+                        ),
+                        mass: split_mass,
+                        boost_dx: dx,
+                        boost_dy: dy,
+                        boost_distance: self.cfg.player_split_boost,
+                        born_at: now,
+                        obs_vx: 0.0,
+                        obs_vy: 0.0,
+                    });
+                }
+            }
         }
     }
 
@@ -1083,7 +1368,6 @@ impl CoreWorld {
         control: (usize, usize, usize, f64),
         out: &mut [f32],
     ) {
-        let rf = self.cfg.blob_radius_factor;
         let world_w = self.cfg.world_width;
         let world_h = self.cfg.world_height;
         let me = &self.players[pi];
@@ -1100,36 +1384,63 @@ impl CoreWorld {
         let mut own_sorted: Vec<&Blob> = me.blobs.iter().collect();
         own_sorted.sort_by(|a, b| b.mass.partial_cmp(&a.mass).unwrap());
         let largest_mass = own_sorted[0].mass;
-        let largest_radius = own_sorted[0].radius(rf);
+        let largest_radius = own_sorted[0].size();
         let max_merge_in = me
             .blobs
             .iter()
-            .map(|b| (b.can_merge_at - now).max(0.0))
+            .map(|b| (self.merge_ready_at(b) - now).max(0.0))
             .fold(f64::NEG_INFINITY, f64::max);
-        let can_split = largest_mass >= OBS_MIN_SPLIT_MASS && me.blobs.len() < OBS_MAX_BLOBS;
-        let my_split_reach = largest_radius + OBS_SPLIT_TRAVEL;
+        let can_split = largest_mass >= self.cfg.player_min_split_mass
+            && me.blobs.len() < self.cfg.max_player_blobs;
+        let my_split_reach = self.cfg.player_split_distance
+            + self.cfg.player_split_boost
+            + largest_radius / 2.0_f64.sqrt();
         let my_half_mass = largest_mass / 2.0;
 
         let mut i = 0usize;
-        let mut put = |out: &mut [f32], i: &mut usize, v: f64| {
+        let put = |out: &mut [f32], i: &mut usize, v: f64| {
             out[*i] = v as f32;
             *i += 1;
         };
 
-        put(out, &mut i, fclamp((total_mass / 560.0).ln() / 3.0, -1.5, 1.5));
-        put(out, &mut i, me.blobs.len() as f64 / 16.0);
+        put(
+            out,
+            &mut i,
+            fclamp(
+                (total_mass / self.cfg.player_start_mass).ln() / 3.0,
+                -1.5,
+                1.5,
+            ),
+        );
+        put(
+            out,
+            &mut i,
+            me.blobs.len() as f64 / self.cfg.max_player_blobs as f64,
+        );
         put(out, &mut i, (largest_radius / 250.0).min(2.0));
         put(out, &mut i, cx / world_w * 2.0 - 1.0);
         put(out, &mut i, cy / world_h * 2.0 - 1.0);
         put(out, &mut i, (cx.min(world_w - cx) / OBS_VIEW).min(1.0));
         put(out, &mut i, (cy.min(world_h - cy) / OBS_VIEW).min(1.0));
         put(out, &mut i, if can_split { 1.0 } else { 0.0 });
-        put(out, &mut i, (1400.0 / largest_mass.powf(0.45) / 400.0).min(1.5));
-        put(out, &mut i, if largest_mass > OBS_VIRUS_MASS * 1.15 { 1.0 } else { 0.0 });
+        put(
+            out,
+            &mut i,
+            (88.0 * largest_radius.powf(-0.439_675_4) * TICK_RATE / 400.0).min(1.5),
+        );
+        put(
+            out,
+            &mut i,
+            if largest_radius > size_from_mass(self.cfg.virus_mass) * self.cfg.eat_size_ratio {
+                1.0
+            } else {
+                0.0
+            },
+        );
         put(out, &mut i, fclamp(my_vx / OBS_SPEED_NORM, -2.0, 2.0));
         put(out, &mut i, fclamp(my_vy / OBS_SPEED_NORM, -2.0, 2.0));
         put(out, &mut i, (my_split_reach / OBS_VIEW).min(1.0));
-        put(out, &mut i, (max_merge_in / OBS_MERGE_DELAY).min(1.0));
+        put(out, &mut i, (max_merge_in / 60.0).min(1.0));
         let (heading, prev_turn, prev_op, prev_speed) = control;
         let heading_angle = (heading as f64 / OBS_N_DIRECTIONS as f64) * TWO_PI;
         put(out, &mut i, heading_angle.sin());
@@ -1145,22 +1456,42 @@ impl CoreWorld {
             let dx = blob.x - cx;
             let dy = blob.y - cy;
             let dist = dx.hypot(dy);
-            let (sin_b, cos_b) = if dist > 1e-6 { (dy / dist, dx / dist) } else { (0.0, 1.0) };
-            let merge_in = (blob.can_merge_at - now).max(0.0);
+            let (sin_b, cos_b) = if dist > 1e-6 {
+                (dy / dist, dx / dist)
+            } else {
+                (0.0, 1.0)
+            };
+            let merge_in = (self.merge_ready_at(blob) - now).max(0.0);
             put(out, &mut i, (dist / OBS_VIEW).min(1.5));
             put(out, &mut i, sin_b);
             put(out, &mut i, cos_b);
             put(out, &mut i, blob.mass / total_mass);
-            put(out, &mut i, (blob.radius(rf) / 250.0).min(2.0));
-            put(out, &mut i, if blob.mass >= OBS_MIN_SPLIT_MASS { 1.0 } else { 0.0 });
-            put(out, &mut i, fclamp((blob.obs_vx - my_vx) / OBS_SPEED_NORM, -2.5, 2.5));
-            put(out, &mut i, fclamp((blob.obs_vy - my_vy) / OBS_SPEED_NORM, -2.5, 2.5));
-            put(out, &mut i, (merge_in / OBS_MERGE_DELAY).min(1.0));
+            put(out, &mut i, (blob.size() / 250.0).min(2.0));
+            put(
+                out,
+                &mut i,
+                if blob.mass >= self.cfg.player_min_split_mass {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+            put(
+                out,
+                &mut i,
+                fclamp((blob.obs_vx - my_vx) / OBS_SPEED_NORM, -2.5, 2.5),
+            );
+            put(
+                out,
+                &mut i,
+                fclamp((blob.obs_vy - my_vy) / OBS_SPEED_NORM, -2.5, 2.5),
+            );
+            put(out, &mut i, (merge_in / 60.0).min(1.0));
         }
         i = OBS_SELF_DIM + OBS_K_OWN * OBS_OWN_F;
 
         // (dist, dx, dy, mass, radius, vx, vy, owner_mass, owner_cells, merge_in)
-        let mut enemies: Vec<(f64, f64, f64, f64, f64, f64, f64, f64, usize, f64)> = Vec::new();
+        let mut enemies: Vec<EnemyObservation> = Vec::new();
         for (pj, other) in self.players.iter().enumerate() {
             if pj == pi {
                 continue;
@@ -1177,12 +1508,12 @@ impl CoreWorld {
                         dx,
                         dy,
                         blob.mass,
-                        blob.radius(rf),
+                        blob.size(),
                         blob.obs_vx,
                         blob.obs_vy,
                         o_mass,
                         o_cells,
-                        (blob.can_merge_at - now).max(0.0),
+                        (self.merge_ready_at(blob) - now).max(0.0),
                     ));
                 }
             }
@@ -1191,7 +1522,11 @@ impl CoreWorld {
         for &(dist, dx, dy, em, er, evx, evy, o_mass, o_cells, merge_in) in
             enemies.iter().take(OBS_K_ENEMY)
         {
-            let (ux, uy) = if dist > 1e-6 { (dx / dist, dy / dist) } else { (1.0, 0.0) };
+            let (ux, uy) = if dist > 1e-6 {
+                (dx / dist, dy / dist)
+            } else {
+                (1.0, 0.0)
+            };
             let rel_vx = evx - my_vx;
             let rel_vy = evy - my_vy;
             let closing = -(rel_vx * ux + rel_vy * uy);
@@ -1202,29 +1537,80 @@ impl CoreWorld {
             put(out, &mut i, ux);
             put(out, &mut i, fclamp(closing / OBS_SPEED_NORM, -2.5, 2.5));
             put(out, &mut i, fclamp(tangential / OBS_SPEED_NORM, -2.5, 2.5));
-            put(out, &mut i, fclamp((em / largest_mass).ln() / 2.0, -2.0, 2.0));
-            put(out, &mut i, if largest_mass >= em * OBS_EAT_RATIO { 1.0 } else { 0.0 });
-            put(out, &mut i, if em >= largest_mass * OBS_EAT_RATIO { 1.0 } else { 0.0 });
             put(
                 out,
                 &mut i,
-                if can_split && my_half_mass >= em * OBS_EAT_RATIO { 1.0 } else { 0.0 },
+                fclamp((em / largest_mass).ln() / 2.0, -2.0, 2.0),
             );
-            put(out, &mut i, fclamp(dist / (my_split_reach + er), 0.0, 3.0));
-            let their_reach = er + OBS_SPLIT_TRAVEL;
             put(
                 out,
                 &mut i,
-                if em / 2.0 >= largest_mass * OBS_EAT_RATIO && em >= OBS_MIN_SPLIT_MASS {
+                if largest_radius >= er * self.cfg.eat_size_ratio {
                     1.0
                 } else {
                     0.0
                 },
             );
-            put(out, &mut i, fclamp(dist / (their_reach + largest_radius), 0.0, 3.0));
-            put(out, &mut i, fclamp((o_mass.max(1.0) / total_mass).ln() / 2.0, -2.0, 2.0));
-            put(out, &mut i, o_cells as f64 / 16.0);
-            put(out, &mut i, (merge_in / OBS_MERGE_DELAY).min(1.0));
+            put(
+                out,
+                &mut i,
+                if er >= largest_radius * self.cfg.eat_size_ratio {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+            put(
+                out,
+                &mut i,
+                if can_split && size_from_mass(my_half_mass) >= er * self.cfg.eat_size_ratio {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+            put(
+                out,
+                &mut i,
+                fclamp(
+                    dist / (my_split_reach - er / self.cfg.eat_overlap_divisor).max(1.0),
+                    0.0,
+                    3.0,
+                ),
+            );
+            let their_reach =
+                self.cfg.player_split_distance + self.cfg.player_split_boost + er / 2.0_f64.sqrt();
+            put(
+                out,
+                &mut i,
+                if size_from_mass(em / 2.0) >= largest_radius * self.cfg.eat_size_ratio
+                    && em >= self.cfg.player_min_split_mass
+                {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+            put(
+                out,
+                &mut i,
+                fclamp(
+                    dist / (their_reach - largest_radius / self.cfg.eat_overlap_divisor).max(1.0),
+                    0.0,
+                    3.0,
+                ),
+            );
+            put(
+                out,
+                &mut i,
+                fclamp((o_mass.max(1.0) / total_mass).ln() / 2.0, -2.0, 2.0),
+            );
+            put(
+                out,
+                &mut i,
+                o_cells as f64 / self.cfg.max_player_blobs as f64,
+            );
+            put(out, &mut i, (merge_in / 60.0).min(1.0));
         }
         i = OBS_SELF_DIM + OBS_K_OWN * OBS_OWN_F + OBS_K_ENEMY * OBS_ENEMY_F;
 
@@ -1285,7 +1671,11 @@ impl CoreWorld {
         }
         pellets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         for &(dist, dx, dy, fm) in pellets.iter().take(OBS_K_FOOD) {
-            let (ux, uy) = if dist > 1e-6 { (dx / dist, dy / dist) } else { (1.0, 0.0) };
+            let (ux, uy) = if dist > 1e-6 {
+                (dx / dist, dy / dist)
+            } else {
+                (1.0, 0.0)
+            };
             put(out, &mut i, (dist / OBS_VIEW).min(1.0));
             put(out, &mut i, uy);
             put(out, &mut i, ux);
@@ -1308,29 +1698,50 @@ impl CoreWorld {
         }
         viruses.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         for &(dist, dx, dy) in viruses.iter().take(OBS_K_VIRUS) {
-            let (ux, uy) = if dist > 1e-6 { (dx / dist, dy / dist) } else { (1.0, 0.0) };
+            let (ux, uy) = if dist > 1e-6 {
+                (dx / dist, dy / dist)
+            } else {
+                (1.0, 0.0)
+            };
             put(out, &mut i, (dist / OBS_VIEW).min(1.5));
             put(out, &mut i, uy);
             put(out, &mut i, ux);
-            put(out, &mut i, if largest_mass > OBS_VIRUS_MASS * 1.15 { 1.0 } else { 0.0 });
+            put(
+                out,
+                &mut i,
+                if largest_radius > size_from_mass(self.cfg.virus_mass) * self.cfg.eat_size_ratio {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
         }
     }
 
-    fn leaderboard(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let mut rows: Vec<(String, i64)> = self
+    fn leaderboard(&self, py: Python<'_>, you: Option<&str>) -> PyResult<Py<PyList>> {
+        let mut rows: Vec<(u64, String, i64)> = self
             .players
             .iter()
             .filter(|p| p.total_mass() > 0.0)
-            .map(|p| (p.name.clone(), round0(p.total_mass())))
+            .map(|p| (p.id, p.name.clone(), round0(p.total_mass())))
             .collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1)); // stable, descending
-        rows.truncate(10);
+        rows.sort_by(|a, b| b.2.cmp(&a.2));
+
+        let local_id = you.and_then(|id| id.strip_prefix('p')?.parse::<u64>().ok());
+        let local_rank = local_id.and_then(|id| rows.iter().position(|row| row.0 == id));
+        let mut visible: Vec<usize> = (0..rows.len().min(10)).collect();
+        if let Some(rank) = local_rank.filter(|rank| *rank >= 10) {
+            visible.push(rank);
+        }
 
         let list = PyList::empty(py);
-        for (name, score) in rows {
+        for rank in visible {
+            let (id, name, score) = &rows[rank];
             let row = PyDict::new(py);
             row.set_item("name", name)?;
             row.set_item("score", score)?;
+            row.set_item("rank", rank + 1)?;
+            row.set_item("you", local_id == Some(*id))?;
             list.append(row)?;
         }
         Ok(list.unbind())
@@ -1371,7 +1782,7 @@ impl CoreWorld {
         player.set_item("score", round0(player_score))?;
         payload.set_item("player", player)?;
 
-        payload.set_item("leaderboard", self.leaderboard(py)?)?;
+        payload.set_item("leaderboard", self.leaderboard(py, you)?)?;
 
         let blob_list = PyList::empty(py);
         for &(pi, bi) in blobs {
@@ -1473,7 +1884,7 @@ impl CoreWorld {
             self.cfg.player_colors[self.players.len() % self.cfg.player_colors.len()].clone()
         });
 
-        let (spawn_x, spawn_y) = self.random_spawn(40.0);
+        let (spawn_x, spawn_y) = self.player_spawn(size_from_mass(self.cfg.player_start_mass));
         let blob_id = self.next_blob_id;
         self.next_blob_id += 1;
 
@@ -1490,9 +1901,10 @@ impl CoreWorld {
                 x: spawn_x,
                 y: spawn_y,
                 mass: self.cfg.player_start_mass,
-                vx: 0.0,
-                vy: 0.0,
-                can_merge_at: now + self.cfg.merge_delay_seconds,
+                boost_dx: 0.0,
+                boost_dy: 0.0,
+                boost_distance: 0.0,
+                born_at: now,
                 obs_vx: 0.0,
                 obs_vy: 0.0,
             }],
@@ -1507,7 +1919,10 @@ impl CoreWorld {
         };
         self.players.push(player);
 
-        PlayerHandle { id: format!("p{player_id}"), name }
+        PlayerHandle {
+            id: format!("p{player_id}"),
+            name,
+        }
     }
 
     fn remove_player(&mut self, player_id: &str) {
@@ -1525,8 +1940,12 @@ impl CoreWorld {
         split: bool,
         eject: bool,
     ) {
-        let Some(id) = self.parse_player_id(player_id) else { return };
-        let Some(pos) = self.player_pos(id) else { return };
+        let Some(id) = self.parse_player_id(player_id) else {
+            return;
+        };
+        let Some(pos) = self.player_pos(id) else {
+            return;
+        };
         let player = &mut self.players[pos];
 
         if let (Some(tx), Some(ty)) = (target_x, target_y) {
@@ -1555,17 +1974,22 @@ impl CoreWorld {
 
         self.respawn_eliminated_players(now);
         self.apply_actions(now);
+        self.move_viruses(dt);
         self.move_blobs(dt, now);
         self.move_ejected(dt);
+        self.resolve_ejected_collisions();
 
+        self.rebuild_spatial_indexes();
+        self.resolve_virus_ejected_collisions();
         self.rebuild_spatial_indexes();
         self.resolve_blob_food_collisions();
         self.resolve_blob_ejected_collisions();
         self.resolve_blob_blob_collisions(now);
         self.resolve_virus_blob_collisions(now);
         self.apply_mass_decay(dt);
+        self.autosplit_players(now);
 
-        self.spawn_food_to_target();
+        self.maintain_world_entities(dt);
         self.rebuild_spatial_indexes();
 
         if dt > 0.0 {
@@ -1575,11 +1999,6 @@ impl CoreWorld {
                     if let Some((px, py)) = prev_pos.get(&blob.id) {
                         blob.obs_vx = (blob.x - px) * inv_dt;
                         blob.obs_vy = (blob.y - py) * inv_dt;
-                    } else {
-                        // New blob this tick (split/explosion): boost velocity
-                        // is the best instantaneous estimate.
-                        blob.obs_vx = blob.vx;
-                        blob.obs_vy = blob.vy;
                     }
                 }
             }
@@ -1629,10 +2048,10 @@ impl CoreWorld {
                                 b.x,
                                 b.y,
                                 b.mass,
-                                b.radius(self.cfg.blob_radius_factor),
+                                b.size(),
                                 b.obs_vx,
                                 b.obs_vy,
-                                b.can_merge_at,
+                                self.merge_ready_at(b),
                             )
                         })
                         .collect(),
@@ -1659,7 +2078,7 @@ impl CoreWorld {
                     f.x,
                     f.y,
                     f.mass,
-                    f.mass.sqrt() * self.cfg.food_radius_factor,
+                    size_from_mass(f.mass),
                     self.cfg.food_colors[f.color].clone(),
                 )
             })
@@ -1673,9 +2092,9 @@ impl CoreWorld {
                     e.x,
                     e.y,
                     e.mass,
-                    e.mass.sqrt() * self.cfg.blob_radius_factor,
+                    size_from_mass(e.mass),
                     format!("p{}", e.owner_id),
-                    e.ttl,
+                    -1.0,
                 )
             })
             .collect();
@@ -1688,7 +2107,7 @@ impl CoreWorld {
                     v.x,
                     v.y,
                     v.mass,
-                    v.mass.sqrt() * self.cfg.virus_radius_factor,
+                    size_from_mass(v.mass),
                 )
             })
             .collect();
@@ -1711,14 +2130,18 @@ impl CoreWorld {
     /// organic play rarely visits.
     #[pyo3(signature = (player_id, parts, now))]
     fn scatter_player(&mut self, player_id: &str, parts: usize, now: f64) {
-        let Some(id) = self.parse_player_id(player_id) else { return };
-        let Some(pi) = self.player_pos(id) else { return };
+        let Some(id) = self.parse_player_id(player_id) else {
+            return;
+        };
+        let Some(pi) = self.player_pos(id) else {
+            return;
+        };
         if self.players[pi].blobs.is_empty() {
             return;
         }
 
         let total_mass = self.players[pi].total_mass();
-        let max_parts = ((total_mass / self.cfg.min_blob_mass).floor() as usize)
+        let max_parts = ((total_mass / self.cfg.player_min_mass).floor() as usize)
             .min(self.cfg.max_player_blobs);
         let parts = parts.clamp(1, max_parts.max(1));
         let (cx, cy) = self.players[pi].center();
@@ -1729,7 +2152,7 @@ impl CoreWorld {
             let angle = (idx as f64 / parts as f64) * TWO_PI + self.rng.uniform(-0.3, 0.3);
             let (ux, uy) = (angle.cos(), angle.sin());
             let offset = self.rng.uniform(20.0, 160.0);
-            let speed = self.cfg.split_boost_speed * self.rng.uniform(0.3, 0.9);
+            let boost = self.cfg.player_split_boost * self.rng.uniform(0.3, 0.9);
             let blob_id = self.next_blob_id;
             self.next_blob_id += 1;
             let blob = Blob {
@@ -1738,11 +2161,12 @@ impl CoreWorld {
                 x: clamp(cx + ux * offset, 0.0, self.cfg.world_width),
                 y: clamp(cy + uy * offset, 0.0, self.cfg.world_height),
                 mass: part_mass,
-                vx: ux * speed,
-                vy: uy * speed,
-                can_merge_at: now + self.cfg.merge_delay_seconds,
-                obs_vx: ux * speed,
-                obs_vy: uy * speed,
+                boost_dx: ux,
+                boost_dy: uy,
+                boost_distance: boost,
+                born_at: now,
+                obs_vx: 0.0,
+                obs_vy: 0.0,
             };
             self.players[pi].blobs.push(blob);
         }
@@ -1752,14 +2176,18 @@ impl CoreWorld {
     /// blobs) — creates big-vs-small matchups on demand.
     #[pyo3(signature = (player_id, total_mass))]
     fn set_player_mass(&mut self, player_id: &str, total_mass: f64) {
-        let Some(id) = self.parse_player_id(player_id) else { return };
-        let Some(pi) = self.player_pos(id) else { return };
+        let Some(id) = self.parse_player_id(player_id) else {
+            return;
+        };
+        let Some(pi) = self.player_pos(id) else {
+            return;
+        };
         let current = self.players[pi].total_mass();
         if current <= 0.0 {
             return;
         }
         let factor = total_mass / current;
-        let min_mass = self.cfg.min_blob_mass;
+        let min_mass = self.cfg.player_min_mass;
         for blob in self.players[pi].blobs.iter_mut() {
             blob.mass = (blob.mass * factor).max(min_mass);
         }
@@ -1769,7 +2197,6 @@ impl CoreWorld {
     /// `control` per player: (heading, prev_turn, prev_op, prev_speed).
     /// Returns raw little-endian f32 bytes, shape (len(player_ids), OBS_DIM) —
     /// decode with np.frombuffer(buf, dtype=np.float32).reshape(n, OBS_DIM).
-    /// Mirrors bot_solutions/rl_v1/obs.py::encode (rl_v1/tools/obs_equivalence.py guards).
     #[pyo3(signature = (player_ids, now, control))]
     fn observe(
         &self,
@@ -1787,9 +2214,7 @@ impl CoreWorld {
                 }
             }
         }
-        let bytes = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 4) };
         PyBytes::new(py, bytes).unbind()
     }
 
@@ -1815,7 +2240,7 @@ impl CoreWorld {
             .collect()
     }
 
-    /// Full raw state for parity testing against the Python world.
+    /// Full raw state for mechanics diagnostics.
     fn debug_state(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let state = PyDict::new(py);
 
@@ -1834,9 +2259,9 @@ impl CoreWorld {
                     b.x,
                     b.y,
                     b.mass,
-                    b.vx,
-                    b.vy,
-                    b.can_merge_at,
+                    b.boost_dx,
+                    b.boost_dy,
+                    self.merge_ready_at(b),
                 ))?;
             }
             entry.set_item("blobs", blobs)?;
@@ -1864,9 +2289,9 @@ impl CoreWorld {
                 e.y,
                 e.mass,
                 format!("p{}", e.owner_id),
-                e.vx,
-                e.vy,
-                e.ttl,
+                e.boost_dx,
+                e.boost_dy,
+                e.boost_distance,
             ))?;
         }
         state.set_item("ejected", ejected)?;
@@ -1890,20 +2315,8 @@ impl CoreWorld {
         let player = &self.players[pos];
         let cfg = &self.cfg;
 
-        let (cx, cy) = player.center();
-        let total_mass = player.total_mass().max(cfg.player_start_mass);
-        let split_count = (player.blobs.len() as i64 - 1).max(0);
-        let base_zoom = 1.52 - total_mass.powf(0.4) / 22.0;
-        let mut max_penalty = cfg.split_zoom_max_penalty;
-        let mass_span = cfg.split_zoom_mass_hard_cap - cfg.split_zoom_mass_soft_cap;
-        if mass_span > 0.0 {
-            let mass_t = clamp((total_mass - cfg.split_zoom_mass_soft_cap) / mass_span, 0.0, 1.0);
-            let mass_factor = mass_t.powf(cfg.split_zoom_mass_curve.max(0.1));
-            max_penalty += (cfg.split_zoom_max_penalty_huge - max_penalty) * mass_factor;
-        }
-        let split_penalty =
-            max_penalty * (1.0 - (-cfg.split_zoom_decay * split_count as f64).exp());
-        let zoom = clamp(base_zoom - split_penalty, 0.24, 1.35);
+        let (cx, cy) = player.camera_center();
+        let zoom = player.camera_zoom();
         let view_w = cfg.view_width / zoom + cfg.view_padding;
         let view_h = cfg.view_height / zoom + cfg.view_padding;
 
@@ -1913,14 +2326,19 @@ impl CoreWorld {
         let max_y = clamp(cy + view_h / 2.0, 0.0, cfg.world_height);
 
         let mut blob_hits: Vec<usize> = Vec::new();
-        self.blob_grid.query_rect(min_x, min_y, max_x, max_y, &mut blob_hits);
-        let blobs: Vec<(usize, usize)> =
-            blob_hits.iter().map(|&flat| self.blob_index[flat]).collect();
+        self.blob_grid
+            .query_rect(min_x, min_y, max_x, max_y, &mut blob_hits);
+        let blobs: Vec<(usize, usize)> = blob_hits
+            .iter()
+            .map(|&flat| self.blob_index[flat])
+            .collect();
 
         let mut food_hits: Vec<usize> = Vec::new();
-        self.food_grid.query_rect(min_x, min_y, max_x, max_y, &mut food_hits);
+        self.food_grid
+            .query_rect(min_x, min_y, max_x, max_y, &mut food_hits);
         let mut ejected_hits: Vec<usize> = Vec::new();
-        self.ejected_grid.query_rect(min_x, min_y, max_x, max_y, &mut ejected_hits);
+        self.ejected_grid
+            .query_rect(min_x, min_y, max_x, max_y, &mut ejected_hits);
 
         let virus_indices: Vec<usize> = self
             .viruses
@@ -1948,8 +2366,8 @@ impl CoreWorld {
 
     fn snapshot_overview(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let cfg = &self.cfg;
-        let zoom = (cfg.view_width / cfg.world_width).min(cfg.view_height / cfg.world_height)
-            * 0.92;
+        let zoom =
+            (cfg.view_width / cfg.world_width).min(cfg.view_height / cfg.world_height) * 0.92;
 
         let blobs: Vec<(usize, usize)> = self
             .players
