@@ -345,7 +345,6 @@ function drawGrid() {
   ctx.strokeStyle = "#000000";
   ctx.globalAlpha = 0.12 + detail * 0.05;
   ctx.lineWidth = 0.4 + detail * 0.6;
-  ctx.filter = "blur(0.45px)";
   for (let x = xMinor; x <= window.innerWidth; x += cell) {
     ctx.beginPath();
     ctx.moveTo(x, 0);
@@ -358,7 +357,6 @@ function drawGrid() {
     ctx.lineTo(window.innerWidth, y);
     ctx.stroke();
   }
-  ctx.filter = "none";
   ctx.globalAlpha = 1;
 }
 
