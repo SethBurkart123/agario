@@ -1841,6 +1841,64 @@ impl CoreWorld {
     }
 }
 
+#[cfg(test)]
+mod mechanics_checks {
+    use super::*;
+
+    fn empty_world() -> CoreWorld {
+        let cfg = WorldConfig {
+            food_target_count: 0,
+            virus_min_count: 0,
+            ..WorldConfig::default()
+        };
+        CoreWorld::new_internal(7, cfg)
+    }
+
+    #[test]
+    fn start_cell_moves_at_the_reference_rate() {
+        let mut world = empty_world();
+        let id = world.add_player_internal("probe", 0.0);
+        let player = world.player_pos(id).unwrap();
+        world.players[player].blobs[0].x = 7_000.0;
+        world.players[player].blobs[0].y = 7_000.0;
+        world.set_input_raw(id, 8_000.0, 7_000.0, false, false);
+
+        let size = world.players[player].blobs[0].size();
+        let expected = 88.0 * size.powf(-0.439_675_4);
+        world.move_blobs(1.0 / TICK_RATE, 0.0);
+
+        let moved = world.players[player].blobs[0].x - 7_000.0;
+        assert!((moved - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pellet_pickup_uses_the_reference_overlap_boundary() {
+        let check = |offset: f64| {
+            let mut world = empty_world();
+            let id = world.add_player_internal("probe", 0.0);
+            let player = world.player_pos(id).unwrap();
+            let blob = &mut world.players[player].blobs[0];
+            blob.x = 1_000.0;
+            blob.y = 1_000.0;
+            let reach = blob.size() - size_from_mass(1.0) / world.cfg.eat_overlap_divisor;
+            world.foods = vec![Food {
+                id: 1,
+                x: 1_000.0 + reach + offset,
+                y: 1_000.0,
+                mass: 1.0,
+                color: 0,
+                grow_elapsed: 0.0,
+            }];
+            world.rebuild_spatial_indexes();
+            world.resolve_blob_food_collisions();
+            world.foods.is_empty()
+        };
+
+        assert!(check(-0.01));
+        assert!(!check(0.01));
+    }
+}
+
 #[pymethods]
 impl CoreWorld {
     #[new]

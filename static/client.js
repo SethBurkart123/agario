@@ -13,6 +13,7 @@ const VIRUS_BORDER_WORLD = 10;
 const EJECTED_BORDER_WORLD = 2.2;
 const VIRUS_SPIKE_SPACING_WORLD = 6.0;
 const SNAPSHOT_BLEND_MS = 120;
+const CLIENT_PROTOCOL = 2;
 
 let ws;
 let world = { w: 14142.135623730952, h: 14142.135623730952 };
@@ -117,12 +118,18 @@ function connect() {
         type: "join",
         name: playerName,
         spectator: startInOverview,
+        clientProtocol: CLIENT_PROTOCOL,
       }),
     );
   });
 
   ws.addEventListener("message", (event) => {
     const data = JSON.parse(event.data);
+
+    if (data.type === "reload") {
+      location.reload();
+      return;
+    }
 
     if (data.type === "welcome") {
       spectatorMode = Boolean(data.spectator);

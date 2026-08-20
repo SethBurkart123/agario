@@ -17,6 +17,7 @@ from . import config
 from .bots.manager import BotManager
 
 MECHANICS = mechanics()
+CLIENT_PROTOCOL = 2
 
 
 class RealtimeServer:
@@ -140,6 +141,13 @@ static_dir = Path(__file__).resolve().parent.parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
+@app.middleware("http")
+async def disable_browser_cache(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     await state.start()
@@ -175,6 +183,10 @@ async def websocket_handler(websocket: WebSocket) -> None:
         first = await websocket.receive_json()
         if first.get("type") != "join":
             await websocket.close(code=1003, reason="First message must be join")
+            return
+        if first.get("clientProtocol") != CLIENT_PROTOCOL:
+            await websocket.send_json({"type": "reload", "clientProtocol": CLIENT_PROTOCOL})
+            await websocket.close(code=1012, reason="Client update required")
             return
 
         name = str(first.get("name") or "Cell")
