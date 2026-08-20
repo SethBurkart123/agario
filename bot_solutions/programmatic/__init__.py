@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from math import exp, hypot
 
-from .. import config
-from ..bots.registry import BotRegistry
-from ..bots.types import BlobView, BotAction, BotContext, BotInitContext, PlayerView
+from agario import config
+from agario.bots.registry import BotRegistry
+from agario.bots.types import BlobView, BotAction, BotContext, BotInitContext, PlayerView
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:

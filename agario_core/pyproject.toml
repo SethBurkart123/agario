@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "agario-core"
+version = "0.1.0"
+description = "Rust simulation core for the agario clone (shared by live server and RL training)"
+requires-python = ">=3.11"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "agario_core"

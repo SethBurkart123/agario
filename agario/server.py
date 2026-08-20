@@ -14,12 +14,12 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config
 from .bots.manager import BotManager
-from .world import GameWorld
+from .engine import create_world
 
 
 class RealtimeServer:
     def __init__(self) -> None:
-        self.world = GameWorld()
+        self.world = create_world()
         self.bot_manager = BotManager.from_config(self.world)
         self.connections: dict[str, WebSocket] = {}
         self.connection_overview_mode: dict[str, bool] = {}

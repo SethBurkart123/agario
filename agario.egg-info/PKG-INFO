@@ -6,6 +6,10 @@ Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 Requires-Dist: fastapi>=0.116.1
 Requires-Dist: uvicorn[standard]>=0.35.0
+Requires-Dist: agario-core
+Requires-Dist: numpy>=1.26
+Requires-Dist: torch>=2.4; sys_platform == "darwin"
+Requires-Dist: torch==2.8.0; sys_platform == "linux"
 
 # Agar Clone (Python Multiplayer)
 
@@ -58,6 +62,47 @@ Open: `http://localhost:8000`
 - Move: Mouse
 - Split: `Space`
 - Eject Mass: `W`
+
+## Simulation Engines
+
+Two interchangeable engines run the same physics:
+
+- **Rust core** (`agario_core/`, default) — a parity-tested PyO3 port of the
+  Python world. ~1,100x realtime on the full map vs ~15x for Python. Used by
+  the live server and by RL training.
+- **Python reference** (`agario/world.py`) — the readable source of truth.
+
+Select with `AGARIO_ENGINE=rust|python`. Parity is enforced by
+`uv run python -m tools.parity_check`, which drives both engines with an
+identical seed + scripted inputs and compares full state tick-by-tick (the
+Rust core embeds a CPython-compatible MT19937 so seeded runs match bitwise).
+Benchmark either engine with `uv run python -m tools.bench_sim --engine rust`.
+
+If you change game mechanics, change `agario/world.py` AND the mirrored code
+in `agario_core/src/world.rs`, then run the parity check.
+
+## RL Training (neural bots)
+
+`agario/rl/` contains a PPO self-play stack over the Rust core:
+
+```bash
+# train (checkpoints + metrics land in checkpoints/rl/)
+uv run python -m agario.rl.ppo --updates 600 --arenas 4
+
+# watch metrics live at http://localhost:8123
+uv run python -m tools.train_dashboard
+
+# evaluate vs the solo_smart heuristic bots
+uv run python -m agario.rl.eval --checkpoint checkpoints/rl/latest.pt
+
+# play against the trained bots
+AGARIO_BOT_PLUGIN_MODULES=agario.bot_plugins.core,agario.bot_plugins.neural \
+AGARIO_BOT_SPECS=neural:8 uv run python main.py
+```
+
+The neural bot has difficulty knobs: `AGARIO_NEURAL_TEMPERATURE` (higher =
+sloppier) and `AGARIO_NEURAL_THINK_SECONDS` (reaction delay). `--wandb` on the
+trainer logs to Weights & Biases if installed.
 
 ## Notes for Extending
 

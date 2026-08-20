@@ -22,11 +22,13 @@ agario/
 ├── agario/
 │   ├── config.py      # Tunables and constants
 │   ├── bots/          # Bot plugin contracts + runtime manager
-│   ├── bot_plugins/   # Built-in bot strategy packs
 │   ├── models.py      # Dataclasses for entities
 │   ├── spatial.py     # Spatial hash helper
 │   ├── world.py       # Authoritative simulation
 │   └── server.py      # FastAPI + websocket orchestration
+├── bot_solutions/
+│   ├── programmatic/  # Hand-written bot strategies
+│   └── rl_v1/         # Neural bot, training stack, tools, and checkpoints
 ├── static/
 │   ├── index.html
 │   ├── styles.css
@@ -49,6 +51,48 @@ Open: `http://localhost:8000`
 - Move: Mouse
 - Split: `Space`
 - Eject Mass: `W`
+
+## Simulation Engines
+
+Two interchangeable engines run the same physics:
+
+- **Rust core** (`agario_core/`, default) — a parity-tested PyO3 port of the
+  Python world. ~1,100x realtime on the full map vs ~15x for Python. Used by
+  the live server and by RL training.
+- **Python reference** (`agario/world.py`) — the readable source of truth.
+
+Select with `AGARIO_ENGINE=rust|python`. Parity is enforced by
+`uv run python -m tools.parity_check`, which drives both engines with an
+identical seed + scripted inputs and compares full state tick-by-tick (the
+Rust core embeds a CPython-compatible MT19937 so seeded runs match bitwise).
+Benchmark either engine with `uv run python -m tools.bench_sim --engine rust`.
+
+If you change game mechanics, change `agario/world.py` AND the mirrored code
+in `agario_core/src/world.rs`, then run the parity check.
+
+## RL Training (neural bots)
+
+`bot_solutions/rl_v1/` contains the neural bot and its training stack over the
+Rust core:
+
+```bash
+# train (outputs stay inside bot_solutions/rl_v1/checkpoints/)
+uv run python -m bot_solutions.rl_v1.ppo --updates 600 --arenas 4
+
+# watch metrics live at http://localhost:8123
+uv run python -m bot_solutions.rl_v1.tools.train_dashboard
+
+# evaluate vs the solo_smart heuristic bots
+uv run python -m bot_solutions.rl_v1.eval
+
+# play against the trained bots
+AGARIO_BOT_PLUGIN_MODULES=bot_solutions.programmatic,bot_solutions.rl_v1.plugin \
+AGARIO_BOT_SPECS=neural:8 uv run python main.py
+```
+
+The neural bot has difficulty knobs: `AGARIO_NEURAL_TEMPERATURE` (higher =
+sloppier) and `AGARIO_NEURAL_THINK_SECONDS` (reaction delay). `--wandb` on the
+trainer logs to Weights & Biases if installed.
 
 ## Notes for Extending
 
@@ -114,6 +158,6 @@ def register(registry):
 Then include that module in:
 
 ```bash
-AGARIO_BOT_PLUGIN_MODULES="agario.bot_plugins.core,my_project.my_bots"
+AGARIO_BOT_PLUGIN_MODULES="bot_solutions.programmatic,my_project.my_bots"
 AGARIO_BOT_SPECS="my_bot:10:alpha:Alpha"
 ```

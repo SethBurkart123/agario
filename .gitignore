@@ -3,4 +3,5 @@ __pycache__/
 *.pyo
 *.pyd
 
-ai_bot/models/
+bot_solutions/rl_v1/checkpoints/
+agario_core/target/

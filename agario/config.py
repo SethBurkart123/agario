@@ -97,8 +97,11 @@ def _env_csv(name: str, default: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
+# Simulation engine: "rust" (agario_core extension) or "python" (reference).
+ENGINE = os.getenv("AGARIO_ENGINE", "rust").strip().lower()
+
 BOTS_ENABLED = _env_bool("AGARIO_BOTS_ENABLED", True)
-BOT_PLUGIN_MODULES = _env_csv("AGARIO_BOT_PLUGIN_MODULES", "agario.bot_plugins.core")
+BOT_PLUGIN_MODULES = _env_csv("AGARIO_BOT_PLUGIN_MODULES", "bot_solutions.programmatic")
 BOT_SPECS = os.getenv(
     "AGARIO_BOT_SPECS",
     "solo_smart:16",

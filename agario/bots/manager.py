@@ -215,6 +215,8 @@ class BotManager:
         tuple[EjectedView, ...],
         tuple[VirusView, ...],
     ]:
+        if hasattr(self.world, "players_compact"):
+            return self._build_views_compact()
         players: list[PlayerView] = []
         for player in self.world.players.values():
             blobs = tuple(
@@ -270,6 +272,58 @@ class BotManager:
         viruses = tuple(
             VirusView(id=v.id, x=v.x, y=v.y, mass=v.mass, radius=v.radius)
             for v in self.world.viruses.values()
+        )
+
+        return (players_by_id, tuple(players), foods, ejected, viruses)
+
+    def _build_views_compact(
+        self,
+    ) -> tuple[
+        dict[str, PlayerView],
+        tuple[PlayerView, ...],
+        tuple[FoodView, ...],
+        tuple[EjectedView, ...],
+        tuple[VirusView, ...],
+    ]:
+        """View building for the Rust engine, which exposes compact tuples
+        instead of Python model objects."""
+        players: list[PlayerView] = []
+        for pid, name, color, is_bot, plugin, team, _tx, _ty, blob_rows in self.world.players_compact():
+            blobs = tuple(
+                BlobView(
+                    id=bid, player_id=pid, x=x, y=y, mass=mass, radius=radius,
+                    vx=vx, vy=vy, can_merge_at=cma,
+                )
+                for bid, x, y, mass, radius, vx, vy, cma in blob_rows
+            )
+            players.append(
+                PlayerView(
+                    id=pid,
+                    name=name,
+                    color=color,
+                    is_bot=is_bot,
+                    plugin_name=plugin,
+                    team_id=team,
+                    total_mass=sum(b.mass for b in blobs),
+                    blobs=blobs,
+                )
+            )
+
+        players.sort(key=lambda p: p.id)
+        players_by_id = {p.id: p for p in players}
+
+        food_rows, ejected_rows, virus_rows = self.world.entities_compact()
+        foods = tuple(
+            FoodView(id=fid, x=x, y=y, mass=mass, radius=radius, color=color)
+            for fid, x, y, mass, radius, color in food_rows
+        )
+        ejected = tuple(
+            EjectedView(id=eid, x=x, y=y, mass=mass, radius=radius, owner_id=owner, ttl=ttl)
+            for eid, x, y, mass, radius, owner, ttl in ejected_rows
+        )
+        viruses = tuple(
+            VirusView(id=vid, x=x, y=y, mass=mass, radius=radius)
+            for vid, x, y, mass, radius in virus_rows
         )
 
         return (players_by_id, tuple(players), foods, ejected, viruses)
