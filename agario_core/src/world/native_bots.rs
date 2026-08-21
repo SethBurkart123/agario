@@ -96,6 +96,8 @@ impl CoreWorld {
             }
         };
         let eat_ratio = self.cfg.eat_size_ratio * self.cfg.eat_size_ratio;
+        let split_child_mass = largest.mass * 0.5;
+        let split_child_radius = size_from_mass(split_child_mass);
 
         let mut flee_x = 0.0;
         let mut flee_y = 0.0;
@@ -103,6 +105,11 @@ impl CoreWorld {
         let mut closest_gap = f64::INFINITY;
         let mut prey: Option<(f64, f64, f64, u64)> = None;
         let mut prey_score = 0.0;
+        let mut split_lanes = [(0.0_f64, 0_usize, f64::INFINITY); 24];
+        let split_lane_dirs: [(f64, f64); 24] = std::array::from_fn(|lane| {
+            let angle = lane as f64 / 24.0 * std::f64::consts::TAU;
+            (angle.cos(), angle.sin())
+        });
         let mut crowd_x = 0.0;
         let mut crowd_y = 0.0;
         let mut crowd_pressure = 0.0;
@@ -146,6 +153,26 @@ impl CoreWorld {
                         if score > prey_score {
                             prey = Some((blob.x, blob.y, blob.mass, blob.id));
                             prey_score = score;
+                        }
+                    }
+                    let capture_radius =
+                        split_child_radius - blob.size() / self.cfg.eat_overlap_divisor;
+                    if v2 && split_child_mass > blob.mass * (eat_ratio + 0.04) {
+                        let split_dx = blob.x - largest.x;
+                        let split_dy = blob.y - largest.y;
+                        for (stats, &(ux, uy)) in split_lanes.iter_mut().zip(&split_lane_dirs) {
+                            let forward = split_dx * ux + split_dy * uy;
+                            let lateral = (split_dx * uy - split_dy * ux).abs();
+                            let reach = self.cfg.player_split_distance
+                                + self.cfg.player_split_boost
+                                + capture_radius;
+                            if forward > 0.0 && forward < reach && lateral < capture_radius {
+                                stats.0 += blob.mass;
+                                stats.1 += 1;
+                                stats.2 = stats
+                                    .2
+                                    .min((split_dx * split_dx + split_dy * split_dy).sqrt());
+                            }
                         }
                     }
                 }
@@ -204,6 +231,41 @@ impl CoreWorld {
                 y: clamp(cy + uy * 700.0, 0.0, self.cfg.world_height),
                 split: false,
             });
+        }
+
+        if v2
+            && player.blobs.len() <= 4
+            && largest.mass >= self.cfg.player_min_split_mass
+            && now - player.last_split_at > 1.4
+        {
+            let (lane, &(captured_mass, captured_count, nearest)) = split_lanes
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1 .0.total_cmp(&b.1 .0))
+                .unwrap();
+            let reward = captured_mass / largest.mass;
+            let worthwhile = reward > 0.17 + traits.caution * 0.02 - traits.aggression * 0.025;
+            if captured_count >= 2 && worthwhile {
+                let (ux, uy) = split_lane_dirs[lane];
+                let landing_x = largest.x + ux * nearest.min(650.0);
+                let landing_y = largest.y + uy * nearest.min(650.0);
+                let intercepted = self.players.iter().any(|enemy| {
+                    enemy.id != player.id
+                        && enemy.blobs.iter().any(|blob| {
+                            blob.mass > split_child_mass * eat_ratio
+                                && distance_sq(blob.x, blob.y, landing_x, landing_y)
+                                    < (blob.size() + split_child_radius).powi(2)
+                        })
+                });
+                if !intercepted {
+                    return Some(Action {
+                        player_index,
+                        x: clamp(largest.x + ux * 1000.0, 0.0, self.cfg.world_width),
+                        y: clamp(largest.y + uy * 1000.0, 0.0, self.cfg.world_height),
+                        split: true,
+                    });
+                }
+            }
         }
 
         if let Some((px, py, prey_mass, prey_id)) = prey {
