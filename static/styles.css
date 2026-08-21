@@ -28,6 +28,15 @@ body {
   height: 100%;
 }
 
+#game.overview {
+  cursor: grab;
+  touch-action: none;
+}
+
+#game.overview.dragging {
+  cursor: grabbing;
+}
+
 .hud {
   position: fixed;
   z-index: 6;

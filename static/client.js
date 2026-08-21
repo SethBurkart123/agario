@@ -34,6 +34,8 @@ const mouse = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
 const camera = { x: world.w / 2, y: world.h / 2, zoom: 1 };
 const cameraTarget = { x: world.w / 2, y: world.h / 2, zoom: 1 };
 let cameraReady = false;
+let overviewCameraInitialized = false;
+let overviewDrag = null;
 
 let lastFrameAt = performance.now();
 
@@ -57,6 +59,7 @@ function updateControls() {
   speedToggle.hidden = !startInOverview;
   speedToggle.textContent = fullSpeed ? "Full speed: On" : "Full speed: Off";
   speedToggle.setAttribute("aria-pressed", String(fullSpeed));
+  canvas.classList.toggle("overview", spectatorMode);
 }
 
 overviewToggle.addEventListener("click", () => {
@@ -116,6 +119,55 @@ window.addEventListener("mousemove", (evt) => {
   mouse.x = evt.clientX;
   mouse.y = evt.clientY;
 });
+
+canvas.addEventListener("pointerdown", (evt) => {
+  if (!spectatorMode || evt.button !== 0) return;
+  overviewDrag = { id: evt.pointerId, x: evt.clientX, y: evt.clientY };
+  canvas.setPointerCapture(evt.pointerId);
+  canvas.classList.add("dragging");
+});
+
+canvas.addEventListener("pointermove", (evt) => {
+  if (!overviewDrag || evt.pointerId !== overviewDrag.id) return;
+  const dx = evt.clientX - overviewDrag.x;
+  const dy = evt.clientY - overviewDrag.y;
+  overviewDrag.x = evt.clientX;
+  overviewDrag.y = evt.clientY;
+  camera.x -= dx / camera.zoom;
+  camera.y -= dy / camera.zoom;
+  cameraTarget.x = camera.x;
+  cameraTarget.y = camera.y;
+});
+
+function endOverviewDrag(evt) {
+  if (!overviewDrag || evt.pointerId !== overviewDrag.id) return;
+  overviewDrag = null;
+  canvas.classList.remove("dragging");
+}
+
+canvas.addEventListener("pointerup", endOverviewDrag);
+canvas.addEventListener("pointercancel", endOverviewDrag);
+
+canvas.addEventListener(
+  "wheel",
+  (evt) => {
+    if (!spectatorMode) return;
+    evt.preventDefault();
+    const worldX = camera.x + (evt.clientX - window.innerWidth / 2) / camera.zoom;
+    const worldY = camera.y + (evt.clientY - window.innerHeight / 2) / camera.zoom;
+    const fitZoom =
+      Math.min(window.innerWidth / world.w, window.innerHeight / world.h) * 0.92;
+    const nextZoom = clamp(camera.zoom * Math.exp(-evt.deltaY * 0.0015), fitZoom * 0.25, 4);
+
+    camera.x = worldX - (evt.clientX - window.innerWidth / 2) / nextZoom;
+    camera.y = worldY - (evt.clientY - window.innerHeight / 2) / nextZoom;
+    camera.zoom = nextZoom;
+    cameraTarget.x = camera.x;
+    cameraTarget.y = camera.y;
+    cameraTarget.zoom = nextZoom / viewRange();
+  },
+  { passive: false },
+);
 
 window.addEventListener("keydown", (evt) => {
   if (spectatorMode) return;
@@ -186,9 +238,15 @@ function connect() {
 
     if (data.type === "state") {
       state = data;
-      cameraTarget.x = state.camera.x;
-      cameraTarget.y = state.camera.y;
-      cameraTarget.zoom = state.camera.zoom;
+      if (!spectatorMode || !overviewCameraInitialized) {
+        cameraTarget.x = state.camera.x;
+        cameraTarget.y = state.camera.y;
+        cameraTarget.zoom = state.camera.zoom;
+        if (spectatorMode) {
+          overviewCameraInitialized = true;
+          cameraReady = false;
+        }
+      }
       if (!spectatorMode) {
         scoreEl.textContent = `Score: ${state.player.score}`;
       }
@@ -206,6 +264,7 @@ function connect() {
     playerId = null;
     spectatorMode = false;
     cameraReady = false;
+    overviewCameraInitialized = false;
     state = null;
     speedToggle.disabled = false;
     blobVisuals.clear();
@@ -446,7 +505,7 @@ function drawFood(nowMs) {
     const paths = new Map();
     for (const food of state.foods) {
       const p = toScreen(food.x, food.y);
-      const radius = Math.max(5, Math.sqrt(food.mass * 100) * camera.zoom);
+      const radius = screenParticleRadius(food.mass, 5);
       if (!isVisible(p, radius)) continue;
       let path = paths.get(food.color);
       if (!path) {
@@ -483,7 +542,7 @@ function drawFood(nowMs) {
     }
 
     const p = toScreen(food.x, food.y);
-    const radius = Math.max(5, Math.sqrt(food.mass * 100) * camera.zoom);
+    const radius = screenParticleRadius(food.mass, 5);
 
     traceWobblingDisk(p.x, p.y, radius, food.id, nowMs / 1000);
     ctx.fillStyle = food.color;
@@ -497,7 +556,7 @@ function drawEjected(nowMs) {
     const path = new Path2D();
     for (const item of state.ejected) {
       const p = toScreen(item.x, item.y);
-      const radius = Math.max(3.5, Math.sqrt(item.mass * 100) * camera.zoom);
+      const radius = screenParticleRadius(item.mass, 3.5);
       if (!isVisible(p, radius)) continue;
       path.moveTo(p.x + radius, p.y);
       path.arc(p.x, p.y, radius, 0, Math.PI * 2);
@@ -530,7 +589,7 @@ function drawEjected(nowMs) {
     }
 
     const p = toScreen(item.x, item.y);
-    const radius = Math.max(3.5, Math.sqrt(item.mass * 100) * camera.zoom);
+    const radius = screenParticleRadius(item.mass, 3.5);
 
     traceWobblingDisk(p.x, p.y, radius, item.id, nowMs / 1000, 0.03, 20);
     ctx.fillStyle = "#6FE85A";
@@ -547,6 +606,11 @@ function worldRadius(blobLike) {
 
 function worldParticleRadius(mass) {
   return Math.sqrt(mass * 100);
+}
+
+function screenParticleRadius(mass, gameplayMinimum) {
+  const scaled = worldParticleRadius(mass) * camera.zoom;
+  return spectatorMode ? scaled : Math.max(gameplayMinimum, scaled);
 }
 
 function findNearbyConsumer(x, y, particleRadius, rangeFactor, blobs) {
@@ -630,8 +694,8 @@ function drawConsumeFx(dt) {
     const p = toScreen(fx.x, fx.y);
     const radiusBase =
       fx.kind === "food"
-        ? Math.max(5, Math.sqrt(fx.mass * 100) * camera.zoom)
-        : Math.max(3.5, Math.sqrt(fx.mass * 100) * camera.zoom);
+        ? screenParticleRadius(fx.mass, 5)
+        : screenParticleRadius(fx.mass, 3.5);
     const radius = radiusBase;
     ctx.globalAlpha = alpha;
     traceWobblingDisk(p.x, p.y, Math.max(0.1, radius), fx.key, performance.now() / 1000);

@@ -250,7 +250,7 @@ impl CoreWorld {
             .query_rect(cx - view, cy - view, cx + view, cy + view, &mut food_hits);
         let mut bins = [(0.0_f64, 0.0_f64, 0.0_f64); 16];
         let route_angle = player.id as f64 * 2.399_963 + (now / 6.0).floor() * 0.61;
-        for index in food_hits {
+        for &index in &food_hits {
             let food = &self.foods[index];
             let dx = food.x - cx;
             let dy = food.y - cy;
@@ -296,10 +296,10 @@ impl CoreWorld {
                 food_x + away_x * crowd_weight,
                 food_y + away_y * crowd_weight,
             );
-            let corridor_mass: f64 = self
-                .foods
+            let corridor_mass: f64 = food_hits
                 .iter()
-                .filter_map(|food| {
+                .filter_map(|&index| {
+                    let food = &self.foods[index];
                     let dx = food.x - cx;
                     let dy = food.y - cy;
                     let forward = dx * ux + dy * uy;

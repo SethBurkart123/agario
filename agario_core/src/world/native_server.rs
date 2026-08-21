@@ -114,7 +114,7 @@ impl CoreWorld {
             camera: (
                 self.cfg.world_width * 0.5,
                 self.cfg.world_height * 0.5,
-                clamp(zoom, 0.05, 1.35),
+                clamp(zoom, 0.001, 1.35),
             ),
             bounds: (0.0, 0.0, self.cfg.world_width, self.cfg.world_height),
         })

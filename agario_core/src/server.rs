@@ -19,6 +19,7 @@ use crate::world::CoreWorld;
 
 const CLIENT_PROTOCOL: u32 = 4;
 const INPUT_HZ: u32 = 90;
+const BOTS_PER_CLASSIC_AREA: f64 = 512.0;
 const INDEX_HTML: &str = include_str!("../../static/index.html");
 const STYLES_CSS: &str = include_str!("../../static/styles.css");
 const CLIENT_JS: &str = include_str!("../../static/client.js");
@@ -220,7 +221,17 @@ fn spawn_engine(
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1337);
-            let mut world = CoreWorld::new_internal(seed, WorldConfig::default());
+            let bot_count = bot_specs.iter().map(|spec| spec.count).sum::<usize>();
+            let world_config = live_world_config(bot_count);
+            println!(
+                "arena: {:.0}x{:.0}, {} food, {}-{} viruses",
+                world_config.world_width,
+                world_config.world_height,
+                world_config.food_target_count,
+                world_config.virus_min_count,
+                world_config.virus_max_count,
+            );
+            let mut world = CoreWorld::new_internal(seed, world_config);
             for spec in &bot_specs {
                 let prefix = spec
                     .name_prefix
@@ -377,6 +388,21 @@ fn spawn_engine(
         .expect("failed to start simulation thread");
 
     (command_tx, frame_rx)
+}
+
+fn live_world_config(bot_count: usize) -> WorldConfig {
+    let mut config = WorldConfig::default();
+    let area_scale = (bot_count as f64 / BOTS_PER_CLASSIC_AREA).max(1.0);
+    let area = config.world_width * config.world_height * area_scale;
+    config.world_width = (area * 4.0 / 3.0).sqrt();
+    config.world_height = config.world_width * 3.0 / 4.0;
+
+    let entity_scale = area_scale.sqrt();
+    config.food_target_count =
+        ((config.food_target_count as f64 * entity_scale) as usize).min(10_000);
+    config.virus_min_count = (config.virus_min_count as f64 * entity_scale) as usize;
+    config.virus_max_count = config.virus_min_count * 3;
+    config
 }
 
 fn title_case(plugin: &str) -> String {
