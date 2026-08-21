@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@700&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/static/styles.css?v=3" />
+    <link rel="stylesheet" href="/static/styles.css?v=4" />
   </head>
   <body>
     <canvas id="game"></canvas>
@@ -16,9 +16,13 @@
     <div id="status" class="status">Connecting...</div>
     <div class="hud hud-right">
       <h2>Leaderboard</h2>
+      <div class="hud-controls">
+        <button id="overview-toggle" type="button">Overview</button>
+        <button id="speed-toggle" type="button" hidden>Full speed</button>
+      </div>
       <ol id="leaderboard"></ol>
     </div>
 
-    <script type="module" src="/static/client.js?v=6"></script>
+    <script type="module" src="/static/client.js?v=7"></script>
   </body>
 </html>

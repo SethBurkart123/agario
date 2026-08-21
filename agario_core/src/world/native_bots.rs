@@ -103,6 +103,9 @@ impl CoreWorld {
         let mut closest_gap = f64::INFINITY;
         let mut prey: Option<(f64, f64, f64, u64)> = None;
         let mut prey_score = 0.0;
+        let mut crowd_x = 0.0;
+        let mut crowd_y = 0.0;
+        let mut crowd_pressure = 0.0;
 
         for enemy in &self.players {
             if enemy.id == player.id {
@@ -112,7 +115,19 @@ impl CoreWorld {
                 let dx = cx - blob.x;
                 let dy = cy - blob.y;
                 let dist_sq = dx * dx + dy * dy;
-                if blob.mass > smallest.mass * eat_ratio {
+                let threatened = blob.mass > smallest.mass * eat_ratio;
+                let edible = largest.mass > blob.mass * eat_ratio;
+                if !threatened && !edible {
+                    let range = largest.size() + blob.size() + 220.0;
+                    if dist_sq < range * range {
+                        let dist = dist_sq.sqrt().max(1.0);
+                        let pressure = (1.0 - dist / range).powi(2);
+                        crowd_x += dx / dist * pressure;
+                        crowd_y += dy / dist * pressure;
+                        crowd_pressure += pressure;
+                    }
+                }
+                if threatened {
                     let range = 920.0 + blob.size() + smallest.size() * traits.caution;
                     if dist_sq < range * range {
                         let dist = dist_sq.sqrt().max(1.0);
@@ -124,7 +139,7 @@ impl CoreWorld {
                         threat_pressure += pressure;
                         closest_gap = closest_gap.min(gap);
                     }
-                } else if largest.mass > blob.mass * eat_ratio {
+                } else if edible {
                     let dist = dist_sq.sqrt();
                     if dist < 1500.0 {
                         let score = blob.mass.powf(0.78) * traits.aggression / (dist + 120.0);
@@ -177,6 +192,20 @@ impl CoreWorld {
             });
         }
 
+        if crowd_pressure > 0.55 {
+            let nudge = player.id as f64 * 2.399_963;
+            let (ux, uy) = unit_vec(
+                crowd_x + nudge.cos() * crowd_pressure * 0.08,
+                crowd_y + nudge.sin() * crowd_pressure * 0.08,
+            );
+            return Some(Action {
+                player_index,
+                x: clamp(cx + ux * 700.0, 0.0, self.cfg.world_width),
+                y: clamp(cy + uy * 700.0, 0.0, self.cfg.world_height),
+                split: false,
+            });
+        }
+
         if let Some((px, py, prey_mass, prey_id)) = prey {
             let distance = distance_sq(cx, cy, px, py).sqrt();
             let child_mass = largest.mass * 0.5;
@@ -220,7 +249,7 @@ impl CoreWorld {
         self.food_grid
             .query_rect(cx - view, cy - view, cx + view, cy + view, &mut food_hits);
         let mut bins = [(0.0_f64, 0.0_f64, 0.0_f64); 16];
-        let mut nearest: Option<(f64, f64, f64)> = None;
+        let route_angle = player.id as f64 * 2.399_963 + (now / 6.0).floor() * 0.61;
         for index in food_hits {
             let food = &self.foods[index];
             let dx = food.x - cx;
@@ -232,13 +261,11 @@ impl CoreWorld {
             let angle = dy.atan2(dx);
             let bin =
                 (((angle + std::f64::consts::PI) / std::f64::consts::TAU * 16.0) as usize).min(15);
-            let value = food.mass * traits.greed / (45.0 + distance * 0.12);
+            let route_weight = 1.0 + (angle - route_angle).cos() * 0.18;
+            let value = food.mass * traits.greed * route_weight / (45.0 + distance * 0.12);
             bins[bin].0 += value;
             bins[bin].1 += food.x * value;
             bins[bin].2 += food.y * value;
-            if nearest.is_none_or(|row| distance < row.0) {
-                nearest = Some((distance, food.x, food.y));
-            }
         }
         for item in &self.ejected {
             let dx = item.x - cx;
@@ -262,7 +289,13 @@ impl CoreWorld {
         {
             let target_x = best.1 / best.0;
             let target_y = best.2 / best.0;
-            let (ux, uy) = unit_vec(target_x - cx, target_y - cy);
+            let (food_x, food_y) = unit_vec(target_x - cx, target_y - cy);
+            let (away_x, away_y) = unit_vec(crowd_x, crowd_y);
+            let crowd_weight = (crowd_pressure * 0.9).min(0.65);
+            let (ux, uy) = unit_vec(
+                food_x + away_x * crowd_weight,
+                food_y + away_y * crowd_weight,
+            );
             let corridor_mass: f64 = self
                 .foods
                 .iter()

@@ -78,6 +78,36 @@ h2 {
   text-align: center;
 }
 
+.hud-controls {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.hud-controls button {
+  flex: 1;
+  min-height: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 4px;
+  background: rgba(43, 48, 54, 0.58);
+  color: #fff;
+  font: 700 14px/1 "Ubuntu", Arial, sans-serif;
+  cursor: pointer;
+}
+
+.hud-controls button:hover {
+  background: rgba(35, 40, 46, 0.78);
+}
+
+.hud-controls button[aria-pressed="true"] {
+  background: rgba(223, 86, 70, 0.82);
+}
+
+.hud-controls button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
 ol {
   margin: 0;
   padding-left: 18px;

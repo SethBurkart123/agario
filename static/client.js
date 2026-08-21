@@ -3,6 +3,8 @@ const ctx = canvas.getContext("2d");
 const statusEl = document.getElementById("status");
 const scoreEl = document.getElementById("score");
 const leaderboardEl = document.getElementById("leaderboard");
+const overviewToggle = document.getElementById("overview-toggle");
+const speedToggle = document.getElementById("speed-toggle");
 
 const BG_COLOR = "#F4FBFF";
 const GRID_COLOR = "#CDD4D7";
@@ -13,13 +15,14 @@ const VIRUS_BORDER_WORLD = 10;
 const EJECTED_BORDER_WORLD = 2.2;
 const VIRUS_SPIKE_SPACING_WORLD = 6.0;
 const SNAPSHOT_BLEND_MS = 120;
-const CLIENT_PROTOCOL = 3;
+const CLIENT_PROTOCOL = 4;
 
 let ws;
 let world = { w: 14142.135623730952, h: 14142.135623730952 };
 let state = null;
 let playerId = null;
 let spectatorMode = false;
+let fullSpeed = false;
 
 let splitQueued = false;
 let ejectQueued = false;
@@ -48,6 +51,25 @@ const pathIsOverview = window.location.pathname === "/overview";
 const queryOverview = new URLSearchParams(window.location.search).get("overview") === "1";
 const startInOverview = pathIsOverview || queryOverview;
 spectatorMode = startInOverview;
+
+function updateControls() {
+  overviewToggle.textContent = startInOverview ? "Play" : "Overview";
+  speedToggle.hidden = !startInOverview;
+  speedToggle.textContent = fullSpeed ? "Full speed: On" : "Full speed: Off";
+  speedToggle.setAttribute("aria-pressed", String(fullSpeed));
+}
+
+overviewToggle.addEventListener("click", () => {
+  window.location.assign(startInOverview ? "/" : "/overview");
+});
+
+speedToggle.addEventListener("click", () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !spectatorMode) return;
+  speedToggle.disabled = true;
+  ws.send(JSON.stringify({ type: "speed", fullSpeed: !fullSpeed }));
+});
+
+updateControls();
 
 function hashString(value) {
   let hash = 0;
@@ -81,7 +103,7 @@ function autoBorderColor(hex) {
 }
 
 function resize() {
-  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const dpr = clamp(window.devicePixelRatio || 1, 1, 2);
   canvas.width = Math.floor(window.innerWidth * dpr);
   canvas.height = Math.floor(window.innerHeight * dpr);
   canvas.style.width = `${window.innerWidth}px`;
@@ -143,12 +165,22 @@ function connect() {
       playerId = data.playerId || null;
       world = data.world;
       serverInputHz = Math.max(20, Number(data.inputHz || 60));
+      fullSpeed = Boolean(data.fullSpeed);
+      speedToggle.disabled = false;
+      updateControls();
       if (spectatorMode) {
         statusEl.textContent = "Connected as spectator";
         scoreEl.textContent = "Spectator";
       } else {
         statusEl.textContent = "";
       }
+      return;
+    }
+
+    if (data.type === "speed") {
+      fullSpeed = Boolean(data.fullSpeed);
+      speedToggle.disabled = false;
+      updateControls();
       return;
     }
 
@@ -175,6 +207,7 @@ function connect() {
     spectatorMode = false;
     cameraReady = false;
     state = null;
+    speedToggle.disabled = false;
     blobVisuals.clear();
     consumeFx.clear();
     visibleFoods.clear();
@@ -335,6 +368,11 @@ function toScreen(x, y) {
   };
 }
 
+function isVisible(p, radius) {
+  return p.x + radius >= 0 && p.x - radius <= window.innerWidth
+    && p.y + radius >= 0 && p.y - radius <= window.innerHeight;
+}
+
 function drawGrid() {
   const cell = 50 * camera.zoom;
   const detail = clamp((camera.zoom - 0.3) / 0.7, 0, 1);
@@ -345,18 +383,16 @@ function drawGrid() {
   ctx.strokeStyle = "#000000";
   ctx.globalAlpha = 0.12 + detail * 0.05;
   ctx.lineWidth = 0.4 + detail * 0.6;
+  ctx.beginPath();
   for (let x = xMinor; x <= window.innerWidth; x += cell) {
-    ctx.beginPath();
     ctx.moveTo(x, 0);
     ctx.lineTo(x, window.innerHeight);
-    ctx.stroke();
   }
   for (let y = yMinor; y <= window.innerHeight; y += cell) {
-    ctx.beginPath();
     ctx.moveTo(0, y);
     ctx.lineTo(window.innerWidth, y);
-    ctx.stroke();
   }
+  ctx.stroke();
   ctx.globalAlpha = 1;
 }
 
@@ -405,6 +441,27 @@ function traceWobblingDisk(x, y, radius, key, timeSec, roughness = 0.045, points
 
 function drawFood(nowMs) {
   if (!state) return;
+  const dense = blobVisuals.size > 500;
+  if (dense) {
+    const paths = new Map();
+    for (const food of state.foods) {
+      const p = toScreen(food.x, food.y);
+      const radius = Math.max(5, Math.sqrt(food.mass * 100) * camera.zoom);
+      if (!isVisible(p, radius)) continue;
+      let path = paths.get(food.color);
+      if (!path) {
+        path = new Path2D();
+        paths.set(food.color, path);
+      }
+      path.moveTo(p.x + radius, p.y);
+      path.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    }
+    for (const [color, path] of paths) {
+      ctx.fillStyle = color;
+      ctx.fill(path);
+    }
+    return;
+  }
   const blobs = [...blobVisuals.values()];
 
   for (const food of state.foods) {
@@ -436,6 +493,22 @@ function drawFood(nowMs) {
 
 function drawEjected(nowMs) {
   if (!state) return;
+  if (blobVisuals.size > 500) {
+    const path = new Path2D();
+    for (const item of state.ejected) {
+      const p = toScreen(item.x, item.y);
+      const radius = Math.max(3.5, Math.sqrt(item.mass * 100) * camera.zoom);
+      if (!isVisible(p, radius)) continue;
+      path.moveTo(p.x + radius, p.y);
+      path.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    }
+    ctx.fillStyle = "#6FE85A";
+    ctx.fill(path);
+    ctx.strokeStyle = "#4BC443";
+    ctx.lineWidth = worldStroke(EJECTED_BORDER_WORLD);
+    ctx.stroke(path);
+    return;
+  }
   const blobs = [...blobVisuals.values()];
 
   for (const item of state.ejected) {
@@ -513,6 +586,10 @@ function beginConsumeFx(key, kind, x, y, mass, color, targetId) {
 
 function drawConsumeFx(dt) {
   if (consumeFx.size === 0) return;
+  if (blobVisuals.size > 500) {
+    consumeFx.clear();
+    return;
+  }
 
   const blobs = [...blobVisuals.values()];
   for (const [key, fx] of consumeFx.entries()) {
@@ -587,6 +664,12 @@ function findAbsorberId(x, y, particleRadius) {
 }
 
 function syncConsumedEffects(nextState) {
+  if (blobVisuals.size > 500) {
+    consumeFx.clear();
+    visibleFoods.clear();
+    visibleEjected.clear();
+    return;
+  }
   const nextFoods = new Map();
   for (const food of nextState.foods || []) {
     nextFoods.set(food.id, food);
@@ -871,38 +954,93 @@ function drawVirusShape(virus, timeSec, allBlobs) {
   ctx.stroke();
 }
 
-function drawBlobEntity(blob, timeSec, allBlobs, viruses, foods, ejected) {
-  drawBlobShape(blob, timeSec, allBlobs, viruses, foods, ejected);
-
-  ctx.fillStyle = blob.color;
-  ctx.fill();
+function drawBlobLabel(blob, radius) {
+  if (radius < 15) return;
 
   const p = toScreen(blob.x, blob.y);
-  const radius = worldRadius(blob) * camera.zoom;
-  ctx.strokeStyle = autoBorderColor(blob.color);
-  ctx.lineWidth = worldStroke(PLAYER_BORDER_WORLD);
-  ctx.stroke();
-
   const label = blob.name || "Cell";
   const textSize = Math.max(8, Math.max(24, worldRadius(blob) * 0.3) * camera.zoom);
 
   ctx.font = `700 ${textSize}px "Ubuntu", Arial, sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
   ctx.strokeStyle = "rgba(36, 39, 44, 0.92)";
   ctx.lineWidth = Math.max(1.5, textSize * 0.1);
   ctx.strokeText(label, p.x, p.y);
   ctx.fillStyle = "#ffffff";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
   ctx.fillText(label, p.x, p.y);
+}
+
+function drawBlobEntity(blob, timeSec, allBlobs, viruses, foods, ejected) {
+  const radius = worldRadius(blob) * camera.zoom;
+  if (spectatorMode) {
+    const p = toScreen(blob.x, blob.y);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+  } else {
+    drawBlobShape(blob, timeSec, allBlobs, viruses, foods, ejected);
+  }
+
+  ctx.fillStyle = blob.color;
+  ctx.fill();
+  ctx.strokeStyle = autoBorderColor(blob.color);
+  ctx.lineWidth = worldStroke(PLAYER_BORDER_WORLD);
+  ctx.stroke();
+  drawBlobLabel(blob, radius);
+}
+
+function drawDenseBlobs(blobs) {
+  const groups = new Map();
+  const labels = [];
+  const labelRadius = blobs.length > 4000 ? 42 : blobs.length > 1200 ? 30 : 22;
+
+  for (const blob of blobs) {
+    const p = toScreen(blob.x, blob.y);
+    const radius = worldRadius(blob) * camera.zoom;
+    const bucket = Math.floor(Math.log2(Math.max(1, radius)) * 2);
+    const key = `${bucket}:${blob.color}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { bucket, color: blob.color, path: new Path2D() };
+      groups.set(key, group);
+    }
+    group.path.moveTo(p.x + radius, p.y);
+    group.path.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    if (radius >= labelRadius) labels.push({ blob, radius });
+  }
+
+  const lineWidth = worldStroke(PLAYER_BORDER_WORLD);
+  for (const group of [...groups.values()].sort((a, b) => a.bucket - b.bucket)) {
+    ctx.fillStyle = group.color;
+    ctx.fill(group.path);
+    ctx.strokeStyle = autoBorderColor(group.color);
+    ctx.lineWidth = lineWidth;
+    ctx.stroke(group.path);
+  }
+  for (const { blob, radius } of labels) drawBlobLabel(blob, radius);
 }
 
 function drawActors(timeSec) {
   if (!state) return;
 
-  const blobs = [...blobVisuals.values()];
-  const viruses = state.viruses || [];
+  const blobs = [...blobVisuals.values()].filter((blob) => {
+    const p = toScreen(blob.x, blob.y);
+    const radius = worldRadius(blob) * camera.zoom;
+    return isVisible(p, radius);
+  });
+  const viruses = (state.viruses || []).filter((virus) => {
+    const p = toScreen(virus.x, virus.y);
+    const radius = worldRadius(virus) * camera.zoom;
+    return isVisible(p, radius);
+  });
   const foods = state.foods || [];
   const ejected = state.ejected || [];
+
+  if (blobs.length > 500) {
+    drawDenseBlobs(blobs);
+    for (const virus of viruses) drawVirusShape(virus, timeSec, []);
+    return;
+  }
 
   const actors = [];
   for (const blob of blobs) {
@@ -916,7 +1054,7 @@ function drawActors(timeSec) {
 
   for (const actor of actors) {
     if (actor.type === "virus") {
-      drawVirusShape(actor.data, timeSec, blobs);
+      drawVirusShape(actor.data, timeSec, spectatorMode ? [] : blobs);
     } else {
       drawBlobEntity(actor.data, timeSec, blobs, viruses, foods, ejected);
     }

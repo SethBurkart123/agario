@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::config::{WorldConfig, TICK_RATE};
 use crate::world::CoreWorld;
 
-const CLIENT_PROTOCOL: u32 = 3;
+const CLIENT_PROTOCOL: u32 = 4;
 const INPUT_HZ: u32 = 90;
 const INDEX_HTML: &str = include_str!("../../static/index.html");
 const STYLES_CSS: &str = include_str!("../../static/styles.css");
@@ -66,6 +66,10 @@ enum Command {
         player_id: Option<u64>,
         spectator_id: Option<u64>,
     },
+    SetFullSpeed {
+        enabled: bool,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 struct JoinResult {
@@ -74,6 +78,7 @@ struct JoinResult {
     name: String,
     world_width: f64,
     world_height: f64,
+    full_speed: bool,
 }
 
 #[derive(Clone)]
@@ -94,6 +99,8 @@ struct ClientMessage {
     target: Option<Target>,
     split: Option<bool>,
     eject: Option<bool>,
+    #[serde(rename = "fullSpeed")]
+    full_speed: Option<bool>,
     ts: Option<serde_json::Value>,
 }
 
@@ -123,6 +130,7 @@ struct Welcome<'a> {
     spectator: bool,
     tick_rate: f64,
     input_hz: u32,
+    full_speed: bool,
     world: WorldSize,
 }
 
@@ -237,9 +245,10 @@ fn spawn_engine(
             let mut report_busy = Duration::ZERO;
             let mut report_ticks = 0_u64;
             let mut next_tick = Instant::now();
+            let mut next_frame = Instant::now();
+            let mut full_speed = false;
 
             loop {
-                next_tick += interval;
                 let started = Instant::now();
                 while let Ok(command) = command_rx.try_recv() {
                     match command {
@@ -259,6 +268,7 @@ fn spawn_engine(
                                     name: "Spectator".into(),
                                     world_width,
                                     world_height,
+                                    full_speed,
                                 });
                             } else {
                                 let (id, safe_name) =
@@ -270,6 +280,7 @@ fn spawn_engine(
                                     name: safe_name,
                                     world_width,
                                     world_height,
+                                    full_speed,
                                 });
                             }
                         }
@@ -292,7 +303,16 @@ fn spawn_engine(
                             }
                             if let Some(id) = spectator_id {
                                 spectators.remove(&id);
+                                if spectators.is_empty() {
+                                    full_speed = false;
+                                    next_tick = Instant::now();
+                                }
                             }
+                        }
+                        Command::SetFullSpeed { enabled, reply } => {
+                            full_speed = enabled;
+                            next_tick = Instant::now();
+                            let _ = reply.send(full_speed);
                         }
                     }
                 }
@@ -303,7 +323,7 @@ fn spawn_engine(
                 tick += 1;
                 revision += 1;
 
-                if !human_players.is_empty() || !spectators.is_empty() {
+                if started >= next_frame && (!human_players.is_empty() || !spectators.is_empty()) {
                     let players = human_players
                         .iter()
                         .filter_map(|id| {
@@ -319,6 +339,10 @@ fn spawn_engine(
                         players,
                         overview,
                     }));
+                    next_frame += interval;
+                    if started.saturating_duration_since(next_frame) > interval {
+                        next_frame = started + interval;
+                    }
                 }
 
                 let busy = started.elapsed();
@@ -337,11 +361,16 @@ fn spawn_engine(
                     report_busy = Duration::ZERO;
                     report_ticks = 0;
                 }
-                let now = Instant::now();
-                if now < next_tick {
-                    std::thread::sleep(next_tick - now);
-                } else if now.duration_since(next_tick) > interval {
-                    next_tick = now;
+                if full_speed {
+                    next_tick = Instant::now();
+                } else {
+                    next_tick += interval;
+                    let now = Instant::now();
+                    if now < next_tick {
+                        std::thread::sleep(next_tick - now);
+                    } else if now.duration_since(next_tick) > interval {
+                        next_tick = now;
+                    }
                 }
             }
         })
@@ -409,6 +438,7 @@ async fn websocket(socket: WebSocket, state: AppState) {
         spectator: joined.spectator_id.is_some(),
         tick_rate: TICK_RATE,
         input_hz: INPUT_HZ,
+        full_speed: joined.full_speed,
         world: WorldSize {
             w: joined.world_width,
             h: joined.world_height,
@@ -457,6 +487,22 @@ async fn websocket(socket: WebSocket, state: AppState) {
                                     split: input.split.unwrap_or(false),
                                     eject: input.eject.unwrap_or(false),
                                 });
+                            }
+                        } else if input.kind == "speed" && joined.spectator_id.is_some() {
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            if state.commands.send(Command::SetFullSpeed {
+                                enabled: input.full_speed.unwrap_or(false),
+                                reply: reply_tx,
+                            }).is_err() {
+                                break;
+                            }
+                            let Ok(full_speed) = reply_rx.await else { break };
+                            let response = serde_json::json!({
+                                "type": "speed",
+                                "fullSpeed": full_speed,
+                            });
+                            if sender.send(Message::Text(response.to_string().into())).await.is_err() {
+                                break;
                             }
                         }
                     }
