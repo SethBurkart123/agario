@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -155,9 +156,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/", get(index))
         .route("/overview", get(index))
+        .route("/lab", get(index))
         .route("/static/styles.css", get(styles))
         .route("/static/client.js", get(client_script))
         .route("/api/bots", get(bot_status))
+        .route("/api/rl-v2/ladder", get(rl_v2_ladder))
         .route("/ws", get(websocket_upgrade))
         .with_state(state);
 
@@ -179,7 +182,10 @@ fn parse_bot_specs(raw: &str) -> Result<Vec<BotSpec>, String> {
         .map(|part| {
             let fields: Vec<_> = part.split(':').map(str::trim).collect();
             let plugin = fields.first().copied().unwrap_or_default();
-            if !matches!(plugin, "solo_smart" | "solo_smart_v2") {
+            if !matches!(
+                plugin,
+                "solo_smart" | "solo_smart_v2" | "rl_v2_fast" | "rl_v2_h1"
+            ) {
                 return Err(format!("unsupported native bot policy: {plugin}"));
             }
             let count = fields
@@ -409,6 +415,9 @@ fn title_case(plugin: &str) -> String {
     plugin
         .split('_')
         .map(|part| {
+            if part.eq_ignore_ascii_case("rl") {
+                return "RL".into();
+            }
             let mut chars = part.chars();
             chars
                 .next()
@@ -546,6 +555,22 @@ async fn websocket(socket: WebSocket, state: AppState) {
 
 async fn bot_status(State(state): State<AppState>) -> Json<BotStatus> {
     Json((*state.bots).clone())
+}
+
+async fn rl_v2_ladder() -> Response {
+    let path = env::var("AGARIO_RL_V2_LADDER")
+        .unwrap_or_else(|_| "bot_solutions/rl_v2/results/ladder.json".into());
+    let body = fs::read_to_string(path)
+        .unwrap_or_else(|_| r#"{"updatedAt":0,"standings":[],"history":[]}"#.into());
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn index() -> Response {

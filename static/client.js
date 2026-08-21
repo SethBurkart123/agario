@@ -5,6 +5,9 @@ const scoreEl = document.getElementById("score");
 const leaderboardEl = document.getElementById("leaderboard");
 const overviewToggle = document.getElementById("overview-toggle");
 const speedToggle = document.getElementById("speed-toggle");
+const researchPanel = document.getElementById("research-panel");
+const researchStandings = document.getElementById("research-standings");
+const researchLatest = document.getElementById("research-latest");
 
 const BG_COLOR = "#F4FBFF";
 const GRID_COLOR = "#CDD4D7";
@@ -50,9 +53,56 @@ const randomName = () => `Cell-${Math.floor(Math.random() * 900 + 100)}`;
 const playerName = localStorage.getItem(nameKey) || randomName();
 localStorage.setItem(nameKey, playerName);
 const pathIsOverview = window.location.pathname === "/overview";
+const pathIsLab = window.location.pathname === "/lab";
 const queryOverview = new URLSearchParams(window.location.search).get("overview") === "1";
-const startInOverview = pathIsOverview || queryOverview;
+const startInOverview = pathIsOverview || pathIsLab || queryOverview;
 spectatorMode = startInOverview;
+
+function policyLabel(value) {
+  return value
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+    .replace(/^Rl\b/, "RL");
+}
+
+async function refreshResearch() {
+  if (!pathIsLab) return;
+  try {
+    const response = await fetch("/api/rl-v2/ladder", { cache: "no-store" });
+    const ladder = await response.json();
+    researchStandings.replaceChildren();
+    for (const row of ladder.standings || []) {
+      const item = document.createElement("div");
+      item.className = "research-standing";
+      const name = document.createElement("strong");
+      name.textContent = policyLabel(row.policy);
+      const rating = document.createElement("span");
+      rating.textContent = `${Math.round(row.rating)} Elo`;
+      item.append(name, rating);
+      researchStandings.append(item);
+    }
+    const latest = ladder.history?.at(-1);
+    if (latest) {
+      researchLatest.className = "research-result";
+      researchLatest.replaceChildren();
+      const matchup = document.createElement("strong");
+      matchup.textContent = `${policyLabel(latest.candidate)} vs ${policyLabel(latest.opponent)}`;
+      const score = document.createElement("span");
+      score.textContent = `${(latest.meanScore * 100).toFixed(1)}%`;
+      const detail = document.createElement("small");
+      detail.textContent = `${latest.games} games · mass ${latest.candidateMetrics.meanMass.toFixed(1)} vs ${latest.opponentMetrics.meanMass.toFixed(1)} · kills ${latest.candidateMetrics.kills.toFixed(2)} vs ${latest.opponentMetrics.kills.toFixed(2)}`;
+      researchLatest.append(matchup, score, detail);
+    }
+  } catch {
+    researchLatest.textContent = "Benchmark results unavailable.";
+  }
+}
+
+if (pathIsLab) {
+  researchPanel.hidden = false;
+  refreshResearch();
+  setInterval(refreshResearch, 2000);
+}
 
 function updateControls() {
   overviewToggle.textContent = startInOverview ? "Play" : "Overview";

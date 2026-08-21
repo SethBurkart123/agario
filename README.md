@@ -27,7 +27,7 @@ Open <http://localhost:8099>. The overview is at
 <http://localhost:8099/api/bots>.
 
 The default population is `solo_smart:16`. Supported native policies are
-`solo_smart` and `solo_smart_v2`; specs use
+`solo_smart`, `solo_smart_v2`, `rl_v2_fast`, and `rl_v2_h1`; specs use
 `policy[:count[:team[:name-prefix]]]`.
 
 Useful settings:
@@ -57,6 +57,7 @@ agario_core/src/
     └── native_server.rs    # culled wire snapshots
 static/                     # browser canvas client
 bot_solutions/rl_v1/        # separate offline RL training solution
+bot_solutions/rl_v2/        # measured native policy research and ladder
 ```
 
 All live gameplay constants and formulas are in `agario_core/src/config.rs`

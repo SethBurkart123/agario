@@ -1,0 +1,143 @@
+{
+  "updatedAt": 1787292698,
+  "standings": [
+    {
+      "policy": "rl_v2_h1",
+      "rating": 1020.079601402852,
+      "games": 12
+    },
+    {
+      "policy": "rl_v2_fast",
+      "rating": 1000.0892317789513,
+      "games": 12
+    },
+    {
+      "policy": "solo_smart_v2",
+      "rating": 995.221793103688,
+      "games": 6
+    },
+    {
+      "policy": "solo_smart",
+      "rating": 984.6093737145086,
+      "games": 18
+    }
+  ],
+  "history": [
+    {
+      "id": 1787292395,
+      "candidate": "solo_smart_v2",
+      "opponent": "solo_smart",
+      "games": 6,
+      "seconds": 180,
+      "playersPerPolicy": 16,
+      "meanScore": 0.4602864583333333,
+      "candidateMetrics": {
+        "meanMass": 111.39244392763072,
+        "finalMass": 221.4946360135829,
+        "peakMass": 238.83960267013836,
+        "meanCells": 1.9412037037037035,
+        "kills": 0.5520833333333333,
+        "deaths": 0.23958333333333331,
+        "splits": 3.5625,
+        "ejects": 0.0
+      },
+      "opponentMetrics": {
+        "meanMass": 102.71324563782954,
+        "finalMass": 196.02443050411617,
+        "peakMass": 200.9559869570058,
+        "meanCells": 1.1412037037037035,
+        "kills": 0.7395833333333333,
+        "deaths": 0.020833333333333332,
+        "splits": 0.6875,
+        "ejects": 0.0
+      }
+    },
+    {
+      "id": 1787292598,
+      "candidate": "rl_v2_h1",
+      "opponent": "solo_smart",
+      "games": 6,
+      "seconds": 180,
+      "playersPerPolicy": 16,
+      "meanScore": 0.669921875,
+      "candidateMetrics": {
+        "meanMass": 124.50567578362288,
+        "finalMass": 247.32277884292833,
+        "peakMass": 251.65539556653337,
+        "meanCells": 1.811921296296296,
+        "kills": 0.1875,
+        "deaths": 0.07291666666666666,
+        "splits": 2.78125,
+        "ejects": 0.0
+      },
+      "opponentMetrics": {
+        "meanMass": 102.25059168685752,
+        "finalMass": 192.02194760691,
+        "peakMass": 191.71790582570773,
+        "meanCells": 1.0645254629629628,
+        "kills": 0.14583333333333331,
+        "deaths": 0.05208333333333333,
+        "splits": 0.3125,
+        "ejects": 0.0
+      }
+    },
+    {
+      "id": 1787292672,
+      "candidate": "rl_v2_h1",
+      "opponent": "rl_v2_fast",
+      "games": 6,
+      "seconds": 180,
+      "playersPerPolicy": 16,
+      "meanScore": 0.5169270833333334,
+      "candidateMetrics": {
+        "meanMass": 114.31618231644224,
+        "finalMass": 222.9297672139658,
+        "peakMass": 226.3839238776351,
+        "meanCells": 1.697164351851852,
+        "kills": 0.6770833333333333,
+        "deaths": 0.08333333333333333,
+        "splits": 2.427083333333333,
+        "ejects": 0.0
+      },
+      "opponentMetrics": {
+        "meanMass": 109.73822687395683,
+        "finalMass": 226.90768428397877,
+        "peakMass": 234.0178892375933,
+        "meanCells": 1.9425347222222225,
+        "kills": 0.3645833333333333,
+        "deaths": 0.16666666666666666,
+        "splits": 3.4791666666666665,
+        "ejects": 0.0
+      }
+    },
+    {
+      "id": 1787292698,
+      "candidate": "rl_v2_fast",
+      "opponent": "solo_smart",
+      "games": 6,
+      "seconds": 180,
+      "playersPerPolicy": 16,
+      "meanScore": 0.5149739583333334,
+      "candidateMetrics": {
+        "meanMass": 108.82167188694626,
+        "finalMass": 230.7618259060097,
+        "peakMass": 241.52020064377848,
+        "meanCells": 1.9166087962962965,
+        "kills": 0.3958333333333333,
+        "deaths": 0.19791666666666666,
+        "splits": 3.458333333333333,
+        "ejects": 0.0
+      },
+      "opponentMetrics": {
+        "meanMass": 102.94022688705702,
+        "finalMass": 192.6234385132757,
+        "peakMass": 196.96749892076627,
+        "meanCells": 1.1001157407407407,
+        "kills": 0.5729166666666666,
+        "deaths": 0.05208333333333333,
+        "splits": 0.4583333333333333,
+        "ejects": 0.0
+      }
+    }
+  ]
+}

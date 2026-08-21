@@ -50,17 +50,31 @@ impl CoreWorld {
     /// persist between decisions, giving every bot an 8.3 Hz reaction rate
     /// while Rayon distributes that independent work across CPU cores.
     pub fn tick_native_bots(&mut self, now: f64) {
-        let phase = ((now * 25.0) as u64) % 3;
+        let tick = (now * 25.0) as u64;
+        let phase = tick % 3;
         let actions: Vec<Action> = self
             .players
             .par_iter()
             .enumerate()
             .filter(|(_, player)| {
-                player.is_bot && player.bot_plugin.is_some() && player.id % 3 == phase
+                player.is_bot
+                    && player.bot_plugin.is_some()
+                    && if matches!(
+                        player.bot_plugin.as_deref(),
+                        Some("rl_v2_h1" | "rl_v2_fast")
+                    ) {
+                        (player.id + tick) % 3 != 0
+                    } else {
+                        player.id % 3 == phase
+                    }
             })
             .filter_map(|(player_index, player)| {
-                let v2 = player.bot_plugin.as_deref() == Some("solo_smart_v2");
-                self.native_bot_action(player_index, now, v2)
+                let version = match player.bot_plugin.as_deref() {
+                    Some("rl_v2_h1") => 3,
+                    Some("solo_smart_v2" | "rl_v2_fast") => 2,
+                    _ => 1,
+                };
+                self.native_bot_action(player_index, now, version)
             })
             .collect();
 
@@ -74,8 +88,10 @@ impl CoreWorld {
         }
     }
 
-    fn native_bot_action(&self, player_index: usize, now: f64, v2: bool) -> Option<Action> {
+    fn native_bot_action(&self, player_index: usize, now: f64, version: u8) -> Option<Action> {
         let player = &self.players[player_index];
+        let v2 = version >= 2;
+        let h1 = version >= 3;
         let largest = player
             .blobs
             .iter()
@@ -85,7 +101,7 @@ impl CoreWorld {
             .iter()
             .min_by(|a, b| a.mass.total_cmp(&b.mass))?;
         let (cx, cy) = player.center();
-        let traits = if v2 {
+        let mut traits = if v2 {
             TRAITS[(player.id as usize - 1) % TRAITS.len()]
         } else {
             Traits {
@@ -95,9 +111,14 @@ impl CoreWorld {
                 edge_bias: 0.55,
             }
         };
+        if h1 && now - player.last_split_at < 8.0 {
+            traits.aggression *= 0.82;
+            traits.caution *= 1.22;
+        }
         let eat_ratio = self.cfg.eat_size_ratio * self.cfg.eat_size_ratio;
         let split_child_mass = largest.mass * 0.5;
         let split_child_radius = size_from_mass(split_child_mass);
+        let split_ready = now - player.last_split_at > if h1 { 5.0 } else { 1.4 };
 
         let mut flee_x = 0.0;
         let mut flee_y = 0.0;
@@ -113,6 +134,7 @@ impl CoreWorld {
         let mut crowd_x = 0.0;
         let mut crowd_y = 0.0;
         let mut crowd_pressure = 0.0;
+        let mut post_split_danger = 0.0;
 
         for enemy in &self.players {
             if enemy.id == player.id {
@@ -124,6 +146,12 @@ impl CoreWorld {
                 let dist_sq = dx * dx + dy * dy;
                 let threatened = blob.mass > smallest.mass * eat_ratio;
                 let edible = largest.mass > blob.mass * eat_ratio;
+                if h1 && blob.mass > split_child_mass * eat_ratio {
+                    let range = 1100.0 + blob.size() + split_child_radius;
+                    if dist_sq < range * range {
+                        post_split_danger += (1.0 - dist_sq.sqrt() / range).max(0.0);
+                    }
+                }
                 if !threatened && !edible {
                     let range = largest.size() + blob.size() + 220.0;
                     if dist_sq < range * range {
@@ -236,7 +264,8 @@ impl CoreWorld {
         if v2
             && player.blobs.len() <= 4
             && largest.mass >= self.cfg.player_min_split_mass
-            && now - player.last_split_at > 1.4
+            && split_ready
+            && (!h1 || post_split_danger < 0.08)
         {
             let (lane, &(captured_mass, captured_count, nearest)) = split_lanes
                 .iter()
@@ -294,7 +323,8 @@ impl CoreWorld {
                 && child_mass > prey_mass * (eat_ratio + 0.04)
                 && distance < split_reach
                 && reward > 0.17 + traits.caution * 0.02 - traits.aggression * 0.025
-                && now - player.last_split_at > 1.4
+                && split_ready
+                && (!h1 || post_split_danger < 0.08)
                 && !intercepted;
             if reward > 0.035 / traits.aggression || distance < 440.0 {
                 return Some(Action {
@@ -377,7 +407,8 @@ impl CoreWorld {
                 && largest.mass >= 52.0
                 && corridor_mass > 9.0 / traits.greed
                 && closest_gap.is_infinite()
-                && now - player.last_split_at > 1.5;
+                && split_ready
+                && (!h1 || post_split_danger < 0.08);
             return Some(Action {
                 player_index,
                 x: clamp(cx + ux * 950.0, 0.0, self.cfg.world_width),

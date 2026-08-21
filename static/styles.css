@@ -135,6 +135,71 @@ li.you {
   color: #f3a4a0;
 }
 
+.research-panel {
+  position: fixed;
+  z-index: 7;
+  left: 14px;
+  top: 42px;
+  width: min(340px, calc(100vw - 28px));
+  padding: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 6px;
+  background: rgba(35, 40, 46, 0.76);
+  color: #fff;
+  backdrop-filter: blur(8px);
+}
+
+.research-panel header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.research-panel h1 {
+  margin: 0;
+  font-size: 22px;
+}
+
+.research-kicker,
+.research-note {
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.research-standing,
+.research-result {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 12px;
+  padding: 8px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.research-standing strong,
+.research-result strong {
+  font-size: 14px;
+}
+
+.research-standing span,
+.research-result span,
+.research-result small {
+  color: rgba(255, 255, 255, 0.76);
+  font-size: 12px;
+}
+
+.research-result small {
+  grid-column: 1 / -1;
+}
+
+.research-note {
+  margin: 12px 0 0;
+  line-height: 1.4;
+}
+
 @media (max-width: 720px) {
   .hud-right {
     min-width: 190px;
@@ -142,5 +207,10 @@ li.you {
 
   .status {
     font-size: 11px;
+  }
+
+  .research-panel {
+    top: auto;
+    bottom: 48px;
   }
 }

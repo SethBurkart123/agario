@@ -8,6 +8,7 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use crate::config::{WorldConfig, TICK_RATE};
 use crate::rng::PyMt19937;
 
+pub mod native_benchmark;
 mod native_bots;
 mod native_server;
 
@@ -103,6 +104,8 @@ struct Player {
     last_eject_at: f64,
     deaths: u64,
     kills: u64,
+    splits: u64,
+    ejects: u64,
 }
 
 impl Player {
@@ -692,6 +695,7 @@ impl CoreWorld {
         self.players[pi].blobs.append(&mut created);
         if any_created {
             self.players[pi].last_split_at = now;
+            self.players[pi].splits += 1;
         }
     }
 
@@ -747,6 +751,7 @@ impl CoreWorld {
 
         if spawned_any {
             self.players[pi].last_eject_at = now;
+            self.players[pi].ejects += 1;
         }
     }
 
@@ -1902,6 +1907,8 @@ impl CoreWorld {
             last_eject_at: -1e9,
             deaths: 0,
             kills: 0,
+            splits: 0,
+            ejects: 0,
         };
         self.players.push(player);
 
