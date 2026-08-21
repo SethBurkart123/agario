@@ -1,7 +1,8 @@
 mod batch;
-mod config;
+pub mod config;
 mod rng;
-mod world;
+pub mod server;
+pub mod world;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;

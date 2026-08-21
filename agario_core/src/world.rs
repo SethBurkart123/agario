@@ -8,6 +8,9 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use crate::config::{WorldConfig, TICK_RATE};
 use crate::rng::PyMt19937;
 
+mod native_bots;
+mod native_server;
+
 fn clamp(value: f64, min_value: f64, max_value: f64) -> f64 {
     value.max(min_value).min(max_value)
 }
@@ -331,6 +334,53 @@ impl CoreWorld {
     /// pymethod `update`; kept as the single implementation).
     pub(crate) fn update_internal(&mut self, dt: f64, now: f64) {
         self.update(dt, now);
+    }
+
+    pub fn step(&mut self, dt: f64, now: f64) {
+        self.update_internal(dt, now);
+    }
+
+    pub fn add_native_player(
+        &mut self,
+        name: &str,
+        now: f64,
+        bot_plugin: Option<&str>,
+    ) -> (u64, String) {
+        let handle = self.add_player(
+            name,
+            now,
+            bot_plugin.is_some(),
+            bot_plugin.map(str::to_owned),
+            None,
+            None,
+        );
+        let id = handle.id.strip_prefix('p').unwrap().parse().unwrap();
+        (id, handle.name)
+    }
+
+    pub fn remove_native_player(&mut self, id: u64) {
+        self.players.retain(|player| player.id != id);
+    }
+
+    pub fn set_native_input(
+        &mut self,
+        id: u64,
+        target_x: f64,
+        target_y: f64,
+        split: bool,
+        eject: bool,
+    ) {
+        self.set_input_raw(
+            id,
+            clamp(target_x, 0.0, self.cfg.world_width),
+            clamp(target_y, 0.0, self.cfg.world_height),
+            split,
+            eject,
+        );
+    }
+
+    pub fn dimensions(&self) -> (f64, f64) {
+        (self.cfg.world_width, self.cfg.world_height)
     }
 
     pub(crate) fn add_player_internal(&mut self, name: &str, now: f64) -> u64 {
@@ -1717,128 +1767,6 @@ impl CoreWorld {
             );
         }
     }
-
-    fn leaderboard(&self, py: Python<'_>, you: Option<&str>) -> PyResult<Py<PyList>> {
-        let mut rows: Vec<(u64, String, i64)> = self
-            .players
-            .iter()
-            .filter(|p| p.total_mass() > 0.0)
-            .map(|p| (p.id, p.name.clone(), round0(p.total_mass())))
-            .collect();
-        rows.sort_by(|a, b| b.2.cmp(&a.2));
-
-        let local_id = you.and_then(|id| id.strip_prefix('p')?.parse::<u64>().ok());
-        let local_rank = local_id.and_then(|id| rows.iter().position(|row| row.0 == id));
-        let mut visible: Vec<usize> = (0..rows.len().min(10)).collect();
-        if let Some(rank) = local_rank.filter(|rank| *rank >= 10) {
-            visible.push(rank);
-        }
-
-        let list = PyList::empty(py);
-        for rank in visible {
-            let (id, name, score) = &rows[rank];
-            let row = PyDict::new(py);
-            row.set_item("name", name)?;
-            row.set_item("score", score)?;
-            row.set_item("rank", rank + 1)?;
-            row.set_item("you", local_id == Some(*id))?;
-            list.append(row)?;
-        }
-        Ok(list.unbind())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn snapshot_payload(
-        &self,
-        py: Python<'_>,
-        you: Option<&str>,
-        player_name: &str,
-        player_score: f64,
-        camera_x: f64,
-        camera_y: f64,
-        camera_zoom: f64,
-        blobs: &[(usize, usize)],
-        food_indices: &[usize],
-        ejected_indices: &[usize],
-        virus_indices: &[usize],
-    ) -> PyResult<Py<PyDict>> {
-        let payload = PyDict::new(py);
-        payload.set_item("type", "state")?;
-        payload.set_item("you", you)?;
-
-        let world = PyDict::new(py);
-        world.set_item("w", self.cfg.world_width)?;
-        world.set_item("h", self.cfg.world_height)?;
-        payload.set_item("world", world)?;
-
-        let camera = PyDict::new(py);
-        camera.set_item("x", round2(camera_x))?;
-        camera.set_item("y", round2(camera_y))?;
-        camera.set_item("zoom", round3(camera_zoom))?;
-        payload.set_item("camera", camera)?;
-
-        let player = PyDict::new(py);
-        player.set_item("name", player_name)?;
-        player.set_item("score", round0(player_score))?;
-        payload.set_item("player", player)?;
-
-        payload.set_item("leaderboard", self.leaderboard(py, you)?)?;
-
-        let blob_list = PyList::empty(py);
-        for &(pi, bi) in blobs {
-            let owner = &self.players[pi];
-            let blob = &owner.blobs[bi];
-            let entry = PyDict::new(py);
-            entry.set_item("id", format!("b{}", blob.id))?;
-            entry.set_item("playerId", format!("p{}", blob.player_id))?;
-            entry.set_item("name", owner.name.as_str())?;
-            entry.set_item("color", owner.color.as_str())?;
-            entry.set_item("x", round2(blob.x))?;
-            entry.set_item("y", round2(blob.y))?;
-            entry.set_item("mass", round2(blob.mass))?;
-            blob_list.append(entry)?;
-        }
-        payload.set_item("blobs", blob_list)?;
-
-        let food_list = PyList::empty(py);
-        for &fi in food_indices {
-            let food = &self.foods[fi];
-            let entry = PyDict::new(py);
-            entry.set_item("id", format!("f{}", food.id))?;
-            entry.set_item("x", round2(food.x))?;
-            entry.set_item("y", round2(food.y))?;
-            entry.set_item("mass", food.mass)?;
-            entry.set_item("color", self.cfg.food_colors[food.color].as_str())?;
-            food_list.append(entry)?;
-        }
-        payload.set_item("foods", food_list)?;
-
-        let ejected_list = PyList::empty(py);
-        for &ei in ejected_indices {
-            let e = &self.ejected[ei];
-            let entry = PyDict::new(py);
-            entry.set_item("id", format!("e{}", e.id))?;
-            entry.set_item("x", round2(e.x))?;
-            entry.set_item("y", round2(e.y))?;
-            entry.set_item("mass", e.mass)?;
-            ejected_list.append(entry)?;
-        }
-        payload.set_item("ejected", ejected_list)?;
-
-        let virus_list = PyList::empty(py);
-        for &vi in virus_indices {
-            let v = &self.viruses[vi];
-            let entry = PyDict::new(py);
-            entry.set_item("id", format!("v{}", v.id))?;
-            entry.set_item("x", round2(v.x))?;
-            entry.set_item("y", round2(v.y))?;
-            entry.set_item("mass", v.mass)?;
-            virus_list.append(entry)?;
-        }
-        payload.set_item("viruses", virus_list)?;
-
-        Ok(payload.unbind())
-    }
 }
 
 #[cfg(test)]
@@ -2361,94 +2289,5 @@ impl CoreWorld {
         state.set_item("viruses", viruses)?;
 
         Ok(state.unbind())
-    }
-
-    fn snapshot_for(&self, py: Python<'_>, player_id: &str) -> PyResult<Option<Py<PyDict>>> {
-        let Some(id) = self.parse_player_id(player_id) else {
-            return Ok(None);
-        };
-        let Some(pos) = self.player_pos(id) else {
-            return Ok(None);
-        };
-        let player = &self.players[pos];
-        let cfg = &self.cfg;
-
-        let (cx, cy) = player.camera_center();
-        let zoom = player.camera_zoom();
-        let view_w = cfg.view_width / zoom + cfg.view_padding;
-        let view_h = cfg.view_height / zoom + cfg.view_padding;
-
-        let min_x = clamp(cx - view_w / 2.0, 0.0, cfg.world_width);
-        let max_x = clamp(cx + view_w / 2.0, 0.0, cfg.world_width);
-        let min_y = clamp(cy - view_h / 2.0, 0.0, cfg.world_height);
-        let max_y = clamp(cy + view_h / 2.0, 0.0, cfg.world_height);
-
-        let mut blob_hits: Vec<usize> = Vec::new();
-        self.blob_grid
-            .query_rect(min_x, min_y, max_x, max_y, &mut blob_hits);
-        let blobs: Vec<(usize, usize)> = blob_hits
-            .iter()
-            .map(|&flat| self.blob_index[flat])
-            .collect();
-
-        let mut food_hits: Vec<usize> = Vec::new();
-        self.food_grid
-            .query_rect(min_x, min_y, max_x, max_y, &mut food_hits);
-        let mut ejected_hits: Vec<usize> = Vec::new();
-        self.ejected_grid
-            .query_rect(min_x, min_y, max_x, max_y, &mut ejected_hits);
-
-        let virus_indices: Vec<usize> = self
-            .viruses
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| min_x <= v.x && v.x <= max_x && min_y <= v.y && v.y <= max_y)
-            .map(|(i, _)| i)
-            .collect();
-
-        let payload = self.snapshot_payload(
-            py,
-            Some(player_id),
-            &player.name,
-            player.total_mass(),
-            cx,
-            cy,
-            zoom,
-            &blobs,
-            &food_hits,
-            &ejected_hits,
-            &virus_indices,
-        )?;
-        Ok(Some(payload))
-    }
-
-    fn snapshot_overview(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let cfg = &self.cfg;
-        let zoom =
-            (cfg.view_width / cfg.world_width).min(cfg.view_height / cfg.world_height) * 0.92;
-
-        let blobs: Vec<(usize, usize)> = self
-            .players
-            .iter()
-            .enumerate()
-            .flat_map(|(pi, p)| (0..p.blobs.len()).map(move |bi| (pi, bi)))
-            .collect();
-        let food_indices: Vec<usize> = (0..self.foods.len()).collect();
-        let ejected_indices: Vec<usize> = (0..self.ejected.len()).collect();
-        let virus_indices: Vec<usize> = (0..self.viruses.len()).collect();
-
-        self.snapshot_payload(
-            py,
-            None,
-            "Spectator",
-            0.0,
-            cfg.world_width * 0.5,
-            cfg.world_height * 0.5,
-            clamp(zoom, 0.05, 1.35),
-            &blobs,
-            &food_indices,
-            &ejected_indices,
-            &virus_indices,
-        )
     }
 }
